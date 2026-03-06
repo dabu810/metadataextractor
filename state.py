@@ -102,6 +102,13 @@ class AgentState(dict):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # Config / runtime objects — must be registered here so LangGraph
+        # always recognises them as valid state keys even when it reconstructs
+        # state from a merged dict rather than the original constructor kwargs.
+        self.setdefault("agent_config", None)
+        self.setdefault("db_config", None)
+        self.setdefault("connector", None)
+        # Pipeline data
         self.setdefault("phase", "init")
         self.setdefault("all_tables", [])
         self.setdefault("tables_done", set())

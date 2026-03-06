@@ -1,0 +1,36 @@
+# UI
+streamlit>=1.35.0
+
+# Core agent framework
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-anthropic>=0.3.0
+langgraph>=0.2.0
+pydantic>=2.0.0
+
+# Database connectors (install only what you need)
+# PostgreSQL
+psycopg2-binary>=2.9.0
+
+# Oracle
+oracledb>=2.0.0
+# cx_Oracle>=8.3.0     # legacy alternative
+
+# SQL Server
+pyodbc>=5.0.0
+# pymssql>=2.2.0       # alternative
+
+# Teradata
+teradatasql>=20.0.0
+
+# Amazon Redshift
+redshift-connector>=2.1.0
+
+# Google BigQuery
+google-cloud-bigquery>=3.0.0
+google-auth>=2.0.0
+
+# Delta Lake / Databricks
+pyspark>=3.4.0
+delta-spark>=3.0.0
+databricks-sql-connector>=3.0.0

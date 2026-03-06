@@ -1,0 +1,374 @@
+"""
+FastAPI service wrapping the Metadata Extraction Agent.
+
+Exposes REST endpoints consumed by the Streamlit UI container.
+
+Endpoints
+---------
+GET  /health
+POST /extract                     start async extraction → {job_id}
+GET  /jobs/{job_id}               poll status
+GET  /jobs/{job_id}/report        retrieve full JSON report (once done)
+GET  /history                     list saved runs
+DEL  /history/{run_id}            delete a run + its report file
+GET  /history/{run_id}/report     retrieve a saved report by history id
+POST /history/{run_id}/ask        LLM Q&A on a saved report
+GET  /search                      full-text search across all saved reports
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ── package on PYTHONPATH (set via ENV in Docker; fallback for local dev) ─────
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from metadata_agent import AgentConfig, DBConfig, DBType, MetadataExtractionAgent
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Storage ────────────────────────────────────────────────────────────────────
+import os
+DATA_DIR     = Path(os.environ.get("DATA_DIR", "./reports"))
+HISTORY_FILE = DATA_DIR / ".history.json"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_history() -> List[Dict]:
+    if HISTORY_FILE.exists():
+        try:
+            return json.loads(HISTORY_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def _save_history(history: List[Dict]) -> None:
+    HISTORY_FILE.write_text(json.dumps(history, indent=2, default=str))
+
+
+# ── In-memory job store ────────────────────────────────────────────────────────
+_jobs: Dict[str, Dict] = {}
+_lock = threading.Lock()
+
+PIPELINE_NODES = ["connection", "discovery", "extraction", "analysis", "report"]
+
+
+# ── FastAPI app ────────────────────────────────────────────────────────────────
+app = FastAPI(title="Metadata Agent API", version="1.0.0", docs_url="/docs")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Request / Response models ──────────────────────────────────────────────────
+class DBConfigIn(BaseModel):
+    db_type: str
+    host: Optional[str] = None
+    port: Optional[int] = None
+    database: Optional[str] = None
+    schema_name: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    project: Optional[str] = None
+    credentials_path: Optional[str] = None
+    spark_master: Optional[str] = None
+    catalog: Optional[str] = None
+    extra: Dict[str, Any] = {}
+
+
+class ExtractionRequest(BaseModel):
+    db_config: DBConfigIn
+    target_tables: Optional[List[str]] = None
+    sample_size: int = 10_000
+    fd_threshold: float = 1.0
+    id_threshold: float = 0.95
+
+
+class AskRequest(BaseModel):
+    question: str
+
+
+# ── Background extraction runner ───────────────────────────────────────────────
+def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: Dict) -> None:
+    with _lock:
+        _jobs[job_id]["status"] = "running"
+
+    completed: List[str] = []
+    try:
+        agent = MetadataExtractionAgent(agent_cfg)
+
+        for node_name, _ in agent.stream_run():
+            clean = node_name.strip("_").replace("error_end", "error")
+
+            with _lock:
+                if "error" in node_name:
+                    _jobs[job_id]["status"] = "error"
+                    _jobs[job_id]["error"]  = f"Pipeline error at node: {node_name}"
+                else:
+                    real = clean if clean in PIPELINE_NODES else None
+                    if real and real not in completed:
+                        completed.append(real)
+                    _jobs[job_id]["completed_nodes"] = list(completed)
+                    _jobs[job_id]["current_node"]    = clean
+
+        report   = agent._report or {}
+        out_path = str(DATA_DIR / f"{db_type}_{job_id[:8]}.json")
+        Path(out_path).write_text(json.dumps(report, indent=2, default=str))
+
+        # Persist to history
+        summary = report.get("summary", {})
+        entry = {
+            "id":          job_id,
+            "timestamp":   datetime.now().isoformat(),
+            "db_type":     db_type,
+            "host":        db_info.get("host", ""),
+            "database":    db_info.get("database", ""),
+            "schema":      db_info.get("schema", ""),
+            "summary":     summary,
+            "report_path": out_path,
+        }
+        history = _load_history()
+        history.insert(0, entry)
+        _save_history(history)
+
+        with _lock:
+            _jobs[job_id].update({
+                "status":          "done",
+                "completed_nodes": list(PIPELINE_NODES),
+                "current_node":    "report",
+                "report_path":     out_path,
+                "summary":         summary,
+            })
+
+    except Exception as exc:
+        logger.exception("Extraction job %s failed", job_id)
+        with _lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"]  = str(exc)
+
+
+# ── Helper: load report from disk ──────────────────────────────────────────────
+def _load_report_from_path(path: str) -> Dict:
+    p = Path(path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Report file not found on disk")
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not parse report: {e}")
+
+
+# ── Helper: LLM ask ───────────────────────────────────────────────────────────
+def _ask_llm(report: Dict, question: str) -> str:
+    dummy_cfg = AgentConfig(db_config=DBConfig(db_type=DBType("postgres")))
+    agent = MetadataExtractionAgent(dummy_cfg)
+    agent._report = report
+    return agent.ask(question)
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/extract", status_code=202)
+def start_extraction(req: ExtractionRequest, background_tasks: BackgroundTasks):
+    db = req.db_config
+    try:
+        db_cfg = DBConfig(
+            db_type=DBType(db.db_type),
+            host=db.host,
+            port=db.port,
+            database=db.database,
+            schema=db.schema_name,
+            username=db.username,
+            password=db.password,
+            project=db.project,
+            credentials_path=db.credentials_path,
+            spark_master=db.spark_master,
+            catalog=db.catalog,
+            extra=db.extra,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid DB config: {e}")
+
+    job_id   = str(uuid.uuid4())
+    out_path = str(DATA_DIR / f"{db.db_type}_{job_id[:8]}.json")
+
+    agent_cfg = AgentConfig(
+        db_config=db_cfg,
+        target_tables=req.target_tables,
+        sample_size=req.sample_size,
+        fd_threshold=req.fd_threshold,
+        id_threshold=req.id_threshold,
+        output_path=out_path,
+    )
+    db_info = {
+        "host":     db.host or db.project or "",
+        "database": db.database or db.project or "",
+        "schema":   db.schema_name or "",
+    }
+
+    with _lock:
+        _jobs[job_id] = {
+            "id":              job_id,
+            "status":          "queued",
+            "current_node":    None,
+            "completed_nodes": [],
+            "report_path":     None,
+            "summary":         {},
+            "error":           None,
+        }
+
+    background_tasks.add_task(_run_extraction, job_id, agent_cfg, db.db_type, db_info)
+    return {"job_id": job_id}
+
+
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str):
+    with _lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {k: v for k, v in job.items()}   # no large report body
+
+
+@app.get("/jobs/{job_id}/report")
+def get_job_report(job_id: str):
+    with _lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "done":
+        raise HTTPException(status_code=202, detail="Job not yet complete")
+    return _load_report_from_path(job["report_path"])
+
+
+# ── History ────────────────────────────────────────────────────────────────────
+@app.get("/history")
+def list_history():
+    return _load_history()
+
+
+@app.delete("/history/{run_id}")
+def delete_history_entry(run_id: str):
+    history = _load_history()
+    entry   = next((h for h in history if h["id"] == run_id), None)
+    if entry and entry.get("report_path"):
+        Path(entry["report_path"]).unlink(missing_ok=True)
+    _save_history([h for h in history if h["id"] != run_id])
+    return {"ok": True}
+
+
+@app.get("/history/{run_id}/report")
+def get_history_report(run_id: str):
+    history = _load_history()
+    entry   = next((h for h in history if h["id"] == run_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    return _load_report_from_path(entry.get("report_path", ""))
+
+
+@app.post("/history/{run_id}/ask")
+def ask_about_report(run_id: str, req: AskRequest):
+    # Check live jobs first (job_id == run_id for fresh extractions)
+    with _lock:
+        job = _jobs.get(run_id)
+    if job and job["status"] == "done" and job.get("report_path"):
+        report = _load_report_from_path(job["report_path"])
+    else:
+        # Fall back to history on disk
+        history = _load_history()
+        entry   = next((h for h in history if h["id"] == run_id), None)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Report not found")
+        report  = _load_report_from_path(entry.get("report_path", ""))
+    try:
+        answer = _ask_llm(report, req.question)
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Search ─────────────────────────────────────────────────────────────────────
+@app.get("/search")
+def search_metadata(q: str, scope: str = "all", db_type: str = "all"):
+    q_lower  = q.strip().lower()
+    if not q_lower:
+        return []
+
+    results: List[Dict] = []
+    history  = _load_history()
+
+    for h in history:
+        if db_type != "all" and h.get("db_type") != db_type:
+            continue
+        rpath = h.get("report_path", "")
+        if not rpath or not Path(rpath).exists():
+            continue
+        try:
+            report = json.loads(Path(rpath).read_text())
+        except Exception:
+            continue
+
+        run_label = f'{h.get("database","?")} / {h.get("schema","?")} ({h["timestamp"][:10]})'
+
+        if scope in ("tables", "all"):
+            for tname, tmeta in (report.get("tables") or {}).items():
+                if q_lower in tname.lower():
+                    results.append({
+                        "kind":    "table",
+                        "match":   tname,
+                        "context": run_label,
+                        "detail":  f'{tmeta.get("row_count","?") if isinstance(tmeta, dict) else "?"} rows',
+                        "db_type": h["db_type"],
+                        "run_id":  h["id"],
+                    })
+                if isinstance(tmeta, dict):
+                    for col in tmeta.get("columns", []):
+                        if isinstance(col, dict):
+                            cname = col.get("name", "")
+                            ctype = col.get("data_type", "")
+                            if q_lower in cname.lower() or q_lower in ctype.lower():
+                                results.append({
+                                    "kind":    "column",
+                                    "match":   f"{tname}.{cname}",
+                                    "context": run_label,
+                                    "detail":  ctype,
+                                    "db_type": h["db_type"],
+                                    "run_id":  h["id"],
+                                })
+
+        if scope in ("fds", "all"):
+            for fd in (report.get("functional_dependencies") or []):
+                det  = fd.get("determinant", [])
+                dep  = fd.get("dependent", [])
+                tbl  = fd.get("table", "")
+                text = " ".join(det + dep + [tbl]).lower()
+                if q_lower in text:
+                    results.append({
+                        "kind":    "fd",
+                        "match":   f'[{", ".join(det)}] → [{", ".join(dep)}]',
+                        "context": run_label,
+                        "detail":  f"table: {tbl}  conf={fd.get('confidence', 0):.2f}",
+                        "db_type": h["db_type"],
+                        "run_id":  h["id"],
+                    })
+
+    return results[:100]

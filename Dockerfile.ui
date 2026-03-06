@@ -1,0 +1,41 @@
+# ── Stage 1: dependency builder ────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+COPY requirements.ui.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.ui.txt
+
+
+# ── Stage 2: runtime image ─────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+LABEL maintainer="metadata-agent" \
+      description="Metadata Extraction Agent — Streamlit UI"
+
+RUN groupadd -r ui && useradd -r -g ui ui
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+# Copy the Streamlit app and its theme config
+COPY app.py           /app/app.py
+COPY .streamlit/      /app/.streamlit/
+
+RUN chown -R ui:ui /app
+
+ENV AGENT_API_URL=http://agent-api:8000 \
+    PYTHONUNBUFFERED=1
+
+USER ui
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
+
+CMD ["streamlit", "run", "app.py", \
+     "--server.address=0.0.0.0", \
+     "--server.port=8501", \
+     "--server.headless=true"]

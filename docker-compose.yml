@@ -1,0 +1,65 @@
+services:
+
+  # ── Agent API ─────────────────────────────────────────────────────────────────
+  agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: metadata-agent-api:latest
+    container_name: metadata-agent-api
+    restart: unless-stopped
+    ports:
+      - "${AGENT_PORT:-8000}:8000"
+    volumes:
+      - reports_data:/data/reports
+    environment:
+      # Anthropic key — set in .env or shell before running
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      DATA_DIR: /data/reports
+      # Tune log verbosity: debug | info | warning
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - metadata-net
+
+  # ── Streamlit UI ──────────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    image: metadata-agent-ui:latest
+    container_name: metadata-agent-ui
+    restart: unless-stopped
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    environment:
+      # Must match the service name above so Docker DNS resolves it
+      AGENT_API_URL: "http://agent-api:8000"
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - metadata-net
+
+# ── Named volume so reports persist across container restarts ─────────────────
+volumes:
+  reports_data:
+    driver: local
+
+# ── Internal network — UI reaches API via service name, not localhost ─────────
+networks:
+  metadata-net:
+    driver: bridge

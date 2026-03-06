@@ -1,0 +1,35 @@
+# FastAPI service layer
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# Core agent framework
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-anthropic>=0.3.0
+langgraph>=0.2.0
+pydantic>=2.0.0
+
+# Database connectors — comment out any you don't need to reduce image size
+# PostgreSQL
+psycopg2-binary>=2.9.0
+
+# Oracle
+# oracledb>=2.0.0
+
+# SQL Server
+# pyodbc>=5.0.0
+
+# Teradata
+# teradatasql>=20.0.0
+
+# Amazon Redshift
+# redshift-connector>=2.1.0
+
+# Google BigQuery
+# google-cloud-bigquery>=3.0.0
+# google-auth>=2.0.0
+
+# Delta Lake / Databricks
+# pyspark>=3.4.0
+# delta-spark>=3.0.0
+# databricks-sql-connector>=3.0.0

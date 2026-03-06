@@ -1,0 +1,61 @@
+# ── Stage 1: dependency builder ────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.agent.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.agent.txt
+
+
+# ── Stage 2: runtime image ─────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+LABEL maintainer="metadata-agent" \
+      description="Metadata Extraction Agent — FastAPI backend"
+
+# Non-root user for security
+RUN groupadd -r agent && useradd -r -g agent agent
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy the metadata_agent package into /app/metadata_agent/
+RUN mkdir -p /app/metadata_agent
+COPY __init__.py      /app/metadata_agent/__init__.py
+COPY agent.py         /app/metadata_agent/agent.py
+COPY config.py        /app/metadata_agent/config.py
+COPY state.py         /app/metadata_agent/state.py
+COPY connectors/      /app/metadata_agent/connectors/
+COPY tools/           /app/metadata_agent/tools/
+COPY nodes/           /app/metadata_agent/nodes/
+
+# Copy the FastAPI entry-point
+COPY api.py /app/api.py
+
+# Data volume for reports and history
+RUN mkdir -p /data/reports && chown -R agent:agent /data /app
+VOLUME ["/data/reports"]
+
+# PYTHONPATH so `import metadata_agent` resolves to /app/metadata_agent
+ENV PYTHONPATH=/app \
+    DATA_DIR=/data/reports \
+    PYTHONUNBUFFERED=1
+
+USER agent
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["uvicorn", "api:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--log-level", "info"]

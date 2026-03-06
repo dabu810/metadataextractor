@@ -3,7 +3,7 @@ LangGraph agent state definition for the metadata extraction agent.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, TypedDict
 from dataclasses import dataclass, field
 
 
@@ -81,41 +81,35 @@ class CardinalityRelationship:
 # Agent state (passed between LangGraph nodes)
 # ---------------------------------------------------------------------------
 
-class AgentState(dict):
+class AgentState(TypedDict, total=False):
     """
-    TypedDict-like state for LangGraph.  Keys:
+    LangGraph state — typed as TypedDict so LangGraph can introspect
+    every key via annotations and preserve them across all node transitions.
 
-    phase          : current phase name (string)
-    db_config      : DBConfig instance
     agent_config   : AgentConfig instance
+    db_config      : DBConfig instance
     connector      : live DB connector (injected at runtime)
+    phase          : current phase name
     all_tables     : list of (schema, table) tuples discovered
     tables_done    : set of table names whose metadata is extracted
     table_metadata : dict[table_name -> TableMeta]
     func_deps      : list[FunctionalDependency]
     incl_deps      : list[InclusionDependency]
     cardinalities  : list[CardinalityRelationship]
-    messages       : LangChain message history (for LLM node)
+    messages       : LangChain message history
     errors         : list of error strings
     final_report   : dict with the full aggregated report
     """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Config / runtime objects — must be registered here so LangGraph
-        # always recognises them as valid state keys even when it reconstructs
-        # state from a merged dict rather than the original constructor kwargs.
-        self.setdefault("agent_config", None)
-        self.setdefault("db_config", None)
-        self.setdefault("connector", None)
-        # Pipeline data
-        self.setdefault("phase", "init")
-        self.setdefault("all_tables", [])
-        self.setdefault("tables_done", set())
-        self.setdefault("table_metadata", {})
-        self.setdefault("func_deps", [])
-        self.setdefault("incl_deps", [])
-        self.setdefault("cardinalities", [])
-        self.setdefault("messages", [])
-        self.setdefault("errors", [])
-        self.setdefault("final_report", {})
+    agent_config:   Any
+    db_config:      Any
+    connector:      Any
+    phase:          str
+    all_tables:     List
+    tables_done:    Set
+    table_metadata: Dict
+    func_deps:      List
+    incl_deps:      List
+    cardinalities:  List
+    messages:       List
+    errors:         List
+    final_report:   Dict

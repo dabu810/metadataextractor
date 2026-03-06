@@ -148,10 +148,21 @@ class MetadataExtractionAgent:
         """
         Execute the full extraction pipeline and return the final report dict.
         """
-        initial_state = AgentState(
-            agent_config=self._config,
-            db_config=self._config.db_config,
-        )
+        initial_state: AgentState = {
+            "agent_config":   self._config,
+            "db_config":      self._config.db_config,
+            "connector":      None,
+            "phase":          "init",
+            "all_tables":     [],
+            "tables_done":    set(),
+            "table_metadata": {},
+            "func_deps":      [],
+            "incl_deps":      [],
+            "cardinalities":  [],
+            "messages":       [],
+            "errors":         [],
+            "final_report":   {},
+        }
 
         logger.info("Starting metadata extraction pipeline …")
         final_state = self._graph.invoke(initial_state)
@@ -199,10 +210,21 @@ class MetadataExtractionAgent:
         Yield (node_name, partial_state) tuples as the pipeline executes.
         Useful for progress monitoring in notebooks or UIs.
         """
-        initial_state = AgentState(
-            agent_config=self._config,
-            db_config=self._config.db_config,
-        )
+        initial_state: AgentState = {
+            "agent_config":   self._config,
+            "db_config":      self._config.db_config,
+            "connector":      None,
+            "phase":          "init",
+            "all_tables":     [],
+            "tables_done":    set(),
+            "table_metadata": {},
+            "func_deps":      [],
+            "incl_deps":      [],
+            "cardinalities":  [],
+            "messages":       [],
+            "errors":         [],
+            "final_report":   {},
+        }
         for event in self._graph.stream(initial_state):
             for node_name, state_update in event.items():
                 yield node_name, state_update

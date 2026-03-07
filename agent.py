@@ -227,4 +227,6 @@ class MetadataExtractionAgent:
         }
         for event in self._graph.stream(initial_state):
             for node_name, state_update in event.items():
+                if node_name == "report" and isinstance(state_update, dict):
+                    self._report = state_update.get("final_report") or {}
                 yield node_name, state_update

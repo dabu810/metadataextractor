@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
-# deploy.sh — Build and deploy the Metadata Agent (agent-api + ui containers)
+# deploy.sh — Build and deploy all three containers:
+#               agent-api      (metadata extraction  — port 8000)
+#               ontology-api   (OWL/RDF generation   — port 8001)
+#               ui             (Streamlit interface  — port 8501)
 #
 # Usage:
-#   ./deploy.sh               Build images and start both containers
+#   ./deploy.sh               Build images and start all containers
 #   ./deploy.sh --build-only  Build images without starting
 #   ./deploy.sh --start       Start pre-built images (no rebuild)
 #   ./deploy.sh --restart     Restart running containers
 #   ./deploy.sh --stop        Stop containers (keep volumes)
 #   ./deploy.sh --down        Stop containers and remove volumes
-#   ./deploy.sh --logs        Tail logs from both containers
+#   ./deploy.sh --logs        Tail logs from all containers
 #   ./deploy.sh --status      Show container status
 #   ./deploy.sh --help        Show this help message
 # ──────────────────────────────────────────────────────────────────────────────
@@ -31,9 +34,11 @@ COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 ENV_FILE="${SCRIPT_DIR}/.env"
 
 AGENT_IMAGE="metadata-agent-api:latest"
+ONTOLOGY_IMAGE="metadata-ontology-api:latest"
 UI_IMAGE="metadata-agent-ui:latest"
 
 AGENT_PORT="${AGENT_PORT:-8000}"
+ONTOLOGY_PORT="${ONTOLOGY_PORT:-8001}"
 UI_PORT="${UI_PORT:-8501}"
 
 HEALTH_TIMEOUT=90   # seconds to wait for healthy status
@@ -53,8 +58,9 @@ print_banner() {
     echo "  ██  Metadata Agent Deployment Script    ██"
     echo "  ██████████████████████████████████████████"
     echo -e "${RESET}"
-    echo -e "  Agent API → ${CYAN}http://localhost:${AGENT_PORT}${RESET}"
-    echo -e "  UI        → ${CYAN}http://localhost:${UI_PORT}${RESET}"
+    echo -e "  Agent API    → ${CYAN}http://localhost:${AGENT_PORT}${RESET}"
+    echo -e "  Ontology API → ${CYAN}http://localhost:${ONTOLOGY_PORT}${RESET}"
+    echo -e "  UI           → ${CYAN}http://localhost:${UI_PORT}${RESET}"
     echo ""
 }
 
@@ -105,12 +111,20 @@ show_status() {
 # ── Actions ────────────────────────────────────────────────────────────────────
 cmd_build() {
     header "Building Docker Images"
+
     info "Building agent-api image…"
     docker build \
         --file "${SCRIPT_DIR}/Dockerfile.agent" \
         --tag  "${AGENT_IMAGE}" \
         "${SCRIPT_DIR}"
     success "Built ${AGENT_IMAGE}"
+
+    info "Building ontology-api image…"
+    docker build \
+        --file "${SCRIPT_DIR}/Dockerfile.ontology" \
+        --tag  "${ONTOLOGY_IMAGE}" \
+        "${SCRIPT_DIR}"
+    success "Built ${ONTOLOGY_IMAGE}"
 
     info "Building ui image…"
     docker build \
@@ -125,15 +139,18 @@ cmd_start() {
     docker compose -f "$COMPOSE_FILE" up --detach --remove-orphans
 
     echo ""
-    wait_healthy "agent-api" "http://localhost:${AGENT_PORT}/health"
-    wait_healthy "ui"        "http://localhost:${UI_PORT}/_stcore/health"
+    wait_healthy "agent-api"    "http://localhost:${AGENT_PORT}/health"
+    wait_healthy "ontology-api" "http://localhost:${ONTOLOGY_PORT}/health"
+    wait_healthy "ui"           "http://localhost:${UI_PORT}/_stcore/health"
 
     echo ""
     success "All services are up!"
     echo ""
-    echo -e "  ${BOLD}Agent API${RESET}  →  ${CYAN}http://localhost:${AGENT_PORT}${RESET}"
-    echo -e "  ${BOLD}API Docs  ${RESET} →  ${CYAN}http://localhost:${AGENT_PORT}/docs${RESET}"
-    echo -e "  ${BOLD}UI        ${RESET} →  ${CYAN}http://localhost:${UI_PORT}${RESET}"
+    echo -e "  ${BOLD}Agent API    ${RESET} →  ${CYAN}http://localhost:${AGENT_PORT}${RESET}"
+    echo -e "  ${BOLD}Agent Docs   ${RESET} →  ${CYAN}http://localhost:${AGENT_PORT}/docs${RESET}"
+    echo -e "  ${BOLD}Ontology API ${RESET} →  ${CYAN}http://localhost:${ONTOLOGY_PORT}${RESET}"
+    echo -e "  ${BOLD}Ontology Docs${RESET} →  ${CYAN}http://localhost:${ONTOLOGY_PORT}/docs${RESET}"
+    echo -e "  ${BOLD}UI           ${RESET} →  ${CYAN}http://localhost:${UI_PORT}${RESET}"
     echo ""
 }
 
@@ -159,7 +176,8 @@ cmd_restart() {
     header "Restarting Containers"
     docker compose -f "$COMPOSE_FILE" restart
     echo ""
-    wait_healthy "agent-api" "http://localhost:${AGENT_PORT}/health"
+    wait_healthy "agent-api"    "http://localhost:${AGENT_PORT}/health"
+    wait_healthy "ontology-api" "http://localhost:${ONTOLOGY_PORT}/health"
     success "Services restarted."
 }
 
@@ -185,8 +203,9 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Environment variables (set in .env or export):${RESET}"
     echo "  ANTHROPIC_API_KEY   Required for LLM Q&A features"
-    echo "  AGENT_PORT          Agent API port (default: 8000)"
-    echo "  UI_PORT             Streamlit UI port (default: 8501)"
+    echo "  AGENT_PORT          Agent API port      (default: 8000)"
+    echo "  ONTOLOGY_PORT       Ontology API port   (default: 8001)"
+    echo "  UI_PORT             Streamlit UI port   (default: 8501)"
     echo "  LOG_LEVEL           debug | info | warning (default: info)"
     echo ""
 }

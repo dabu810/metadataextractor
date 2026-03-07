@@ -14,6 +14,11 @@ DEL  /history/{run_id}            delete a run + its report file
 GET  /history/{run_id}/report     retrieve a saved report by history id
 POST /history/{run_id}/ask        LLM Q&A on a saved report
 GET  /search                      full-text search across all saved reports
+
+POST /ontology/generate           generate OWL ontology from a saved report → {job_id}
+GET  /ontology/jobs/{job_id}      poll ontology job status
+GET  /ontology/jobs/{job_id}/download  download the OWL/Turtle file
+GET  /ontology/list               list all generated ontologies
 """
 from __future__ import annotations
 

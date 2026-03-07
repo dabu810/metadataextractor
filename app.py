@@ -88,8 +88,61 @@ class APIClient:
     def search(self, q: str, scope: str = "all", db_type: str = "all") -> List[Dict]:
         return self._get("/search", params={"q": q, "scope": scope, "db_type": db_type})
 
-
 api = APIClient(AGENT_API_URL)
+
+
+# ── Ontology API client (separate microservice) ────────────────────────────────
+ONTOLOGY_API_URL = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001").rstrip("/")
+
+
+class OntologyAPIClient:
+    def __init__(self, base: str):
+        self._base = base
+
+    def _check(self, r: "requests.Response") -> "requests.Response":
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
+        return r
+
+    def health(self) -> bool:
+        try:
+            return requests.get(f"{self._base}/health", timeout=5).status_code == 200
+        except Exception:
+            return False
+
+    def generate(self, payload: Dict) -> str:
+        r = self._check(requests.post(f"{self._base}/generate", json=payload, timeout=120))
+        return r.json()["job_id"]
+
+    def get_job(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}", timeout=30)).json()
+
+    def get_content(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}/content", timeout=30)).json()
+
+    def save_content(self, job_id: str, content: str) -> None:
+        self._check(requests.put(f"{self._base}/jobs/{job_id}/content",
+                                 json={"content": content}, timeout=30))
+
+    def get_bytes(self, job_id: str):
+        r = self._check(requests.get(f"{self._base}/jobs/{job_id}/download", timeout=30))
+        disposition = r.headers.get("content-disposition", "")
+        filename = (disposition.split("filename=")[-1].strip('"')
+                    if "filename=" in disposition else "ontology.ttl")
+        return r.content, filename
+
+    def list_jobs(self) -> List[Dict]:
+        try:
+            return requests.get(f"{self._base}/list", timeout=10).json()
+        except Exception:
+            return []
+
+
+onto_api = OntologyAPIClient(ONTOLOGY_API_URL)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_META: Dict[str, Dict] = {
@@ -306,7 +359,9 @@ def _nodes_from_status(status: Dict) -> Dict[str, str]:
 # ── Session state init ─────────────────────────────────────────────────────────
 for _k, _v in [("page", "extract"), ("last_report", None),
                 ("last_run_id", None), ("last_run_meta", None),
-                ("running_job_id", None)]:
+                ("running_job_id", None),
+                ("onto_job_id", None), ("onto_result", None),
+                ("onto_content", None), ("onto_last_job_id", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -319,19 +374,21 @@ def _sidebar() -> None:
             f'<div style="font-size:0.72rem;color:#475569;margin-bottom:0.4rem">Database schema intelligence</div>',
             unsafe_allow_html=True,
         )
-        # API status indicator
-        ok = api.health()
-        dot = "🟢" if ok else "🔴"
-        st.markdown(
-            f'<div class="{"api-status-ok" if ok else "api-status-err"}">'
-            f'{dot} Agent API: {"connected" if ok else "unreachable"}</div>',
-            unsafe_allow_html=True,
-        )
+        # API status indicators
+        for label, checker in [("Agent API", api.health), ("Ontology API", onto_api.health)]:
+            ok  = checker()
+            dot = "🟢" if ok else "🔴"
+            st.markdown(
+                f'<div class="{"api-status-ok" if ok else "api-status-err"}">'
+                f'{dot} {label}: {"connected" if ok else "unreachable"}</div>',
+                unsafe_allow_html=True,
+            )
         st.markdown("---")
 
-        for key, icon, label in [("extract", "⚡", "New Extraction"),
-                                   ("history", "🗂️",  "History"),
-                                   ("search",  "🔍", "Search Metadata")]:
+        for key, icon, label in [("extract",  "⚡",  "New Extraction"),
+                                   ("history",  "🗂️",  "History"),
+                                   ("search",   "🔍", "Search Metadata"),
+                                   ("ontology", "🦉", "Ontology Generator")]:
             active = st.session_state.page == key
             if st.button(
                 f"{icon}  {label}",
@@ -817,6 +874,283 @@ def _search_view() -> None:
                     st.error(f"Could not load: {e}")
 
 
+# ── View: Ontology ─────────────────────────────────────────────────────────────
+_ONTO_NODES = [
+    ("load",      "📂", "Loading metadata report"),
+    ("build",     "🔨", "Building OWL ontology"),
+    ("serialize", "💾", "Serialising to RDF/Turtle"),
+]
+
+
+def _onto_node_html(nodes_state: Dict[str, str]) -> str:
+    icons  = {n[0]: n[1] for n in _ONTO_NODES}
+    labels = {n[0]: n[2] for n in _ONTO_NODES}
+    items  = []
+    for name, _, _ in _ONTO_NODES:
+        s      = nodes_state.get(name, "pending")
+        prefix = {"running": "⟳ ", "done": "✓ ", "error": "✗ "}.get(s, "○ ")
+        items.append(
+            f'<div class="node-item node-{s}">'
+            f'{icons[name]} {prefix}{labels[name]}</div>'
+        )
+    return "<div>" + "".join(items) + "</div>"
+
+
+def _ontology_view() -> None:
+    st.markdown(
+        '<div class="hero"><div class="hero-title">Ontology Generator</div>'
+        '<div class="hero-sub">Convert any extracted schema into a formal OWL/RDF ontology '
+        '— view, edit, and save it right here before downloading.</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not onto_api.health():
+        st.markdown(
+            f'<div class="banner-err">⚠ Ontology API is unreachable at {ONTOLOGY_API_URL}. '
+            f'Make sure the ontology-api container is running.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    history = api.get_history()
+    if not history:
+        st.markdown(
+            '<div class="empty-state"><div class="empty-state-icon">🦉</div>'
+            '<div class="empty-state-text">No extractions yet. Run a metadata extraction first.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Config + Progress ─────────────────────────────────────────────────────
+    col_cfg, col_right = st.columns([3, 2], gap="large")
+
+    with col_cfg:
+        st.markdown('<div class="sec-head">⚙️ Ontology Settings</div>', unsafe_allow_html=True)
+
+        run_options = {
+            f'{h.get("db_type","?").upper()}  ·  {h.get("database","?")} / '
+            f'{h.get("schema","?")}  ({h.get("timestamp","")[:10]})': h["id"]
+            for h in history
+        }
+        selected_label = st.selectbox("Source extraction run", list(run_options.keys()))
+        run_id = run_options[selected_label]
+
+        c1, c2 = st.columns(2)
+        ontology_name = c1.text_input("Ontology name", value="DatabaseOntology")
+        base_uri      = c2.text_input("Base URI", value="http://metadata-agent.io/ontology/")
+
+        fmt_map    = {"Turtle (.ttl)": "turtle", "RDF/XML (.owl)": "xml", "N3 (.n3)": "n3"}
+        fmt_lbl    = st.selectbox("Serialisation format", list(fmt_map.keys()))
+        incl_stats = st.checkbox("Annotate properties with column statistics", value=True)
+
+        gen_btn = st.button(
+            "🦉  Generate Ontology", type="primary", use_container_width=True,
+            disabled=bool(st.session_state.onto_job_id),
+        )
+
+    with col_right:
+        st.markdown('<div class="sec-head">📡 Generation Progress</div>', unsafe_allow_html=True)
+        prog_area  = st.empty()
+        error_area = st.empty()
+
+        job_id = st.session_state.onto_job_id
+        if job_id:
+            try:
+                status = onto_api.get_job(job_id)
+            except Exception as e:
+                error_area.markdown(
+                    f'<div class="banner-err">⚠ API error: {e}</div>', unsafe_allow_html=True)
+                st.session_state.onto_job_id = None
+                status = None
+
+            if status:
+                completed = set(status.get("completed_nodes") or [])
+                current   = status.get("current_node") or ""
+                ns_map    = {
+                    name: ("done"    if name in completed else
+                           "running" if name == current and status["status"] == "running" else
+                           "pending")
+                    for name, _, _ in _ONTO_NODES
+                }
+                prog_area.markdown(_onto_node_html(ns_map), unsafe_allow_html=True)
+
+                if status["status"] == "done":
+                    st.session_state.onto_result      = status
+                    st.session_state.onto_last_job_id = job_id
+                    st.session_state.onto_content     = None  # will be fetched below
+                    st.session_state.onto_job_id      = None
+                    st.balloons()
+                    st.rerun()
+                elif status["status"] == "error":
+                    for k in ns_map:
+                        if ns_map[k] == "running":
+                            ns_map[k] = "error"
+                    prog_area.markdown(_onto_node_html(ns_map), unsafe_allow_html=True)
+                    error_area.markdown(
+                        f'<div class="banner-err">⚠ Generation failed: '
+                        f'{status.get("error","unknown error")}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.session_state.onto_job_id = None
+                else:
+                    time.sleep(1.5)
+                    st.rerun()
+        else:
+            idle = {n[0]: "pending" for n in _ONTO_NODES}
+            prog_area.markdown(_onto_node_html(idle), unsafe_allow_html=True)
+
+    # ── Trigger generation ────────────────────────────────────────────────────
+    if gen_btn:
+        try:
+            report = api.get_history_report(run_id)
+        except Exception as e:
+            st.error(f"Could not load metadata report: {e}")
+            return
+        try:
+            jid = onto_api.generate({
+                "report":             report,
+                "base_uri":           base_uri.strip() or "http://metadata-agent.io/ontology/",
+                "ontology_name":      ontology_name.strip() or "DatabaseOntology",
+                "serialize_format":   fmt_map[fmt_lbl],
+                "include_statistics": incl_stats,
+            })
+            st.session_state.onto_job_id      = jid
+            st.session_state.onto_last_job_id = jid
+            st.session_state.onto_result      = None
+            st.session_state.onto_content     = None
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to start ontology generation: {e}")
+        return
+
+    # ── Ontology result panel ─────────────────────────────────────────────────
+    result   = st.session_state.onto_result
+    last_jid = st.session_state.onto_last_job_id
+
+    if not result or not last_jid or st.session_state.onto_job_id:
+        # Show list of previously generated ontologies from this session
+        done_list = [j for j in onto_api.list_jobs() if j.get("status") == "done"]
+        if done_list:
+            st.markdown(
+                "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div class="sec-head">📚 Generated Ontologies</div>',
+                        unsafe_allow_html=True)
+            for j in done_list:
+                cols = st.columns([7, 1, 1])
+                with cols[0]:
+                    st.markdown(
+                        f'<div class="hcard">'
+                        f'<div class="hcard-title">🦉 {j.get("ontology_name","Ontology")}</div>'
+                        f'<div class="hcard-meta">'
+                        f'{j.get("serialize_format","turtle").upper()} &nbsp;·&nbsp; '
+                        f'{j.get("class_count",0)} classes &nbsp;·&nbsp; '
+                        f'{j.get("property_count",0)} props &nbsp;·&nbsp; '
+                        f'{j.get("triple_count",0)} triples</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🔎 View", key=f"onto_view_{j['id']}"):
+                        st.session_state.onto_result      = j
+                        st.session_state.onto_last_job_id = j["id"]
+                        st.session_state.onto_content     = None
+                        st.rerun()
+                with cols[2]:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("⬇", key=f"onto_dl_{j['id']}"):
+                        try:
+                            content_bytes, filename = onto_api.get_bytes(j["id"])
+                            st.download_button("Save", data=content_bytes, file_name=filename,
+                                               mime="text/turtle", key=f"onto_save_{j['id']}")
+                        except Exception as e:
+                            st.error(str(e))
+        return
+
+    # Stats
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="banner-ok" style="margin-bottom:1rem">✓ Ontology ready</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="stat-row">'
+        + _stat_card(result.get("class_count",    0), "OWL Classes",    "#63b3ed")
+        + _stat_card(result.get("property_count", 0), "OWL Properties", "#b794f4")
+        + _stat_card(result.get("triple_count",   0), "RDF Triples",    "#68d391")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Fetch content once and cache in session state
+    if st.session_state.onto_content is None:
+        try:
+            data = onto_api.get_content(last_jid)
+            st.session_state.onto_content = data.get("content", "")
+        except Exception as e:
+            st.error(f"Could not fetch ontology content: {e}")
+            return
+
+    content_text = st.session_state.onto_content or ""
+    fmt          = result.get("serialize_format", "turtle")
+
+    # ── Read-only rendered view ────────────────────────────────────────────────
+    st.markdown('<div class="sec-head" style="margin-top:1.5rem">📄 Ontology Content</div>',
+                unsafe_allow_html=True)
+
+    with st.expander("View rendered ontology", expanded=True):
+        st.code(content_text, language="turtle" if fmt == "turtle" else "xml")
+
+    # ── Editable view ──────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-head" style="margin-top:1rem">✏️ Edit Ontology</div>',
+                unsafe_allow_html=True)
+    st.caption("Edit the ontology directly. Click Save to persist changes to the server.")
+
+    edited = st.text_area(
+        "Ontology source",
+        value=content_text,
+        height=400,
+        key="onto_editor",
+        label_visibility="collapsed",
+    )
+
+    save_col, dl_col, _ = st.columns([2, 2, 4])
+    with save_col:
+        if st.button("💾  Save Changes", use_container_width=True, type="primary"):
+            if not edited.strip():
+                st.error("Cannot save empty content.")
+            else:
+                try:
+                    onto_api.save_content(last_jid, edited)
+                    st.session_state.onto_content = edited
+                    st.success("Saved successfully.")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
+    with dl_col:
+        try:
+            content_bytes, filename = onto_api.get_bytes(last_jid)
+            st.download_button(
+                "⬇  Download File",
+                data=content_bytes,
+                file_name=filename,
+                mime="text/turtle" if fmt == "turtle" else "application/rdf+xml",
+                use_container_width=True,
+                key="onto_dl_main",
+            )
+        except Exception as e:
+            st.error(f"Download error: {e}")
+
+    if result.get("errors"):
+        with st.expander(f"⚠ {len(result['errors'])} warning(s) during generation"):
+            for err in result["errors"]:
+                st.markdown(f"- {err}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     _inject_css()
@@ -828,6 +1162,8 @@ def main() -> None:
         _history_view()
     elif page == "search":
         _search_view()
+    elif page == "ontology":
+        _ontology_view()
 
 
 if __name__ == "__main__":

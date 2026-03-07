@@ -35,6 +35,9 @@ COPY connectors/      /app/metadata_agent/connectors/
 COPY tools/           /app/metadata_agent/tools/
 COPY nodes/           /app/metadata_agent/nodes/
 
+# Copy the ontology_agent package into /app/ontology_agent/
+COPY ontology_agent/ /app/ontology_agent/
+
 # Copy the FastAPI entry-point
 COPY api.py /app/api.py
 

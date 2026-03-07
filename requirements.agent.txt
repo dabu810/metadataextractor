@@ -2,6 +2,9 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 
+# Ontology generation
+rdflib>=7.0.0
+
 # Core agent framework
 langchain>=0.3.0
 langchain-core>=0.3.0

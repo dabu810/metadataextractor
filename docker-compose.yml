@@ -28,6 +28,31 @@ services:
     networks:
       - metadata-net
 
+  # ── Ontology API ───────────────────────────────────────────────────────────────
+  ontology-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.ontology
+    image: metadata-ontology-api:latest
+    container_name: metadata-ontology-api
+    restart: unless-stopped
+    ports:
+      - "${ONTOLOGY_PORT:-8001}:8001"
+    volumes:
+      - reports_data:/data/reports
+    environment:
+      DATA_DIR: /data/reports
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - metadata-net
+
   # ── Streamlit UI ──────────────────────────────────────────────────────────────
   ui:
     build:
@@ -39,10 +64,13 @@ services:
     ports:
       - "${UI_PORT:-8501}:8501"
     environment:
-      # Must match the service name above so Docker DNS resolves it
-      AGENT_API_URL: "http://agent-api:8000"
+      # Must match service names above so Docker DNS resolves them
+      AGENT_API_URL:    "http://agent-api:8000"
+      ONTOLOGY_API_URL: "http://ontology-api:8001"
     depends_on:
       agent-api:
+        condition: service_healthy
+      ontology-api:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c",

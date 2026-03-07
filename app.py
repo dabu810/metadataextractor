@@ -500,19 +500,18 @@ def _extract_view() -> None:
         run_btn = st.button("⚡  Run Extraction", type="primary", use_container_width=True,
                             disabled=bool(st.session_state.running_job_id))
 
-    # ── Right column: progress + result ───────────────────────────────────────
+    # ── Right column: pipeline progress only ──────────────────────────────────
     with col_right:
         st.markdown('<div class="sec-head">📡 Pipeline Progress</div>', unsafe_allow_html=True)
         progress_area = st.empty()
-        result_area   = st.empty()
+        error_area    = st.empty()
 
-        # ── Poll running job (if any) ─────────────────────────────────────────
         job_id = st.session_state.running_job_id
         if job_id:
             try:
                 status = api.get_job(job_id)
             except Exception as e:
-                result_area.markdown(
+                error_area.markdown(
                     f'<div class="banner-err">⚠ API error while polling: {e}</div>',
                     unsafe_allow_html=True,
                 )
@@ -526,13 +525,14 @@ def _extract_view() -> None:
                 if status["status"] == "done":
                     try:
                         report = api.get_job_report(job_id)
-                        st.session_state.last_report   = report
-                        st.session_state.last_run_id   = job_id
-                        st.session_state.last_run_meta = {"db_type": db_type}
+                        st.session_state.last_report    = report
+                        st.session_state.last_run_id    = job_id
+                        st.session_state.last_run_meta  = {"db_type": db_type}
                         st.session_state.running_job_id = None
                         st.balloons()
+                        st.rerun()          # re-render so the result panel appears
                     except Exception as e:
-                        result_area.markdown(
+                        error_area.markdown(
                             f'<div class="banner-err">⚠ Could not fetch report: {e}</div>',
                             unsafe_allow_html=True,
                         )
@@ -543,22 +543,24 @@ def _extract_view() -> None:
                         if v == "running":
                             nodes_state[k] = "error"
                     progress_area.markdown(_node_html(nodes_state), unsafe_allow_html=True)
-                    result_area.markdown(
+                    error_area.markdown(
                         f'<div class="banner-err">⚠ Extraction failed: {status.get("error","unknown error")}</div>',
                         unsafe_allow_html=True,
                     )
                     st.session_state.running_job_id = None
                 else:
-                    # Still running — sleep then rerun (polling loop)
+                    # Still running — poll again
                     time.sleep(1.5)
                     st.rerun()
         else:
-            # Show idle state or last result
             idle = {n[0]: "pending" for n in PIPELINE_NODES}
             progress_area.markdown(_node_html(idle), unsafe_allow_html=True)
-            if st.session_state.last_report:
-                with result_area.container():
-                    _show_result_panel()
+
+    # ── Result panel — rendered in main body so widgets work correctly ─────────
+    if st.session_state.last_report and not st.session_state.running_job_id:
+        st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+                    unsafe_allow_html=True)
+        _show_result_panel()
 
     # ── Launch extraction ──────────────────────────────────────────────────────
     if run_btn:

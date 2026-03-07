@@ -115,14 +115,22 @@ def analysis_node(state: AgentState) -> AgentState:
     logger.info("=== Inclusion Dependency Detection ===")
     table_names = list(table_metadata.keys())
     pair_count = 0
+    total_col_pairs_tested = 0
 
     for left_name, right_name in itertools.permutations(table_names, 2):
-        if pair_count >= config.max_id_column_pairs:
+        # Break when the column-pair budget is exhausted
+        if total_col_pairs_tested >= config.max_id_column_pairs:
+            logger.info("  IND scan: column-pair budget (%d) reached, stopping.",
+                        config.max_id_column_pairs)
             break
         left_meta  = table_metadata[left_name]
         right_meta = table_metadata[right_name]
 
-        logger.info("  IND scan: %s → %s", left_name, right_name)
+        remaining         = config.max_id_column_pairs - total_col_pairs_tested
+        max_pairs_this_run = min(50, remaining)
+
+        logger.info("  IND scan: %s → %s (budget remaining: %d col pairs)",
+                    left_name, right_name, remaining)
         result_json = id_tool._run(
             schema_name=left_meta.schema_name,
             left_table=left_name,
@@ -131,11 +139,13 @@ def analysis_node(state: AgentState) -> AgentState:
             right_columns=_col_dicts(right_meta),
             sample_size=config.sample_size,
             threshold=config.id_threshold,
-            max_pairs=50,
+            max_pairs=max_pairs_this_run,
         )
         result = json.loads(result_json)
         if "error" in result:
             state["errors"].append(f"IND error [{left_name}→{right_name}]: {result['error']}")
+            # Still charge against budget to avoid retrying broken pairs endlessly
+            total_col_pairs_tested += max_pairs_this_run
             continue
 
         for ind in result.get("inclusion_dependencies", []):
@@ -149,19 +159,29 @@ def analysis_node(state: AgentState) -> AgentState:
                     is_foreign_key_candidate=ind["is_foreign_key_candidate"],
                 )
             )
+        total_col_pairs_tested += result.get("pairs_tested", max_pairs_this_run)
         pair_count += 1
 
     logger.info(
-        "Total INDs found: %d (across %d ordered pairs)",
+        "Total INDs found: %d (across %d ordered pairs, %d column pairs tested)",
         len(state["incl_deps"]),
         pair_count,
+        total_col_pairs_tested,
     )
 
     # ------------------------------------------------------------------
-    # 3. Cardinality Analysis (unordered table pairs)
+    # 3. Cardinality Analysis (unordered table pairs, capped)
     # ------------------------------------------------------------------
     logger.info("=== Cardinality Analysis ===")
+    # Cap at max_fd_column_pairs to avoid O(n²) full-table scans on large schemas
+    cardinality_cap = min(config.max_fd_column_pairs, 200)
+    cardinality_pair_count = 0
+
     for left_name, right_name in itertools.combinations(table_names, 2):
+        if cardinality_pair_count >= cardinality_cap:
+            logger.info("  Cardinality: pair cap (%d) reached, stopping.", cardinality_cap)
+            break
+
         left_meta  = table_metadata[left_name]
         right_meta = table_metadata[right_name]
 
@@ -180,6 +200,7 @@ def analysis_node(state: AgentState) -> AgentState:
         result = json.loads(result_json)
         if "error" in result:
             state["errors"].append(f"Cardinality error [{left_name}↔{right_name}]: {result['error']}")
+            cardinality_pair_count += 1
             continue
 
         for cr in result.get("cardinality_results", []):
@@ -193,8 +214,10 @@ def analysis_node(state: AgentState) -> AgentState:
                     right_unique=cr.get("right_unique_values", 0),
                 )
             )
+        cardinality_pair_count += 1
 
-    logger.info("Total cardinality relationships: %d", len(state["cardinalities"]))
+    logger.info("Total cardinality relationships: %d (across %d pairs)",
+                len(state["cardinalities"]), cardinality_pair_count)
 
     state["phase"] = "analysed"
     return state

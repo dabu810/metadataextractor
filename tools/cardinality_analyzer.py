@@ -77,7 +77,7 @@ class CardinalityAnalyzerTool(BaseTool):
             if lc.lower() in right_col_set and [lc] not in candidates:
                 candidates.append([lc])
 
-        return candidates or [left_cols[:1]]  # fallback to first column
+        return candidates  # empty = no join columns found, skip this pair
 
     def _run(
         self,

@@ -260,16 +260,22 @@ class BaseConnector(abc.ABC):
         self, schema: str,
         left_table: str, right_table: str,
         join_columns: List[str],
+        sample_size: int = 10_000,
     ) -> Dict[str, Any]:
-        """Determine 1:1 / 1:N / M:N between two tables."""
-        left_fqn  = self._fqn(schema, left_table)
-        right_fqn = self._fqn(schema, right_table)
-        jc = ", ".join(self._quote(c) for c in join_columns)
+        """Determine 1:1 / 1:N / M:N between two tables using sampled data."""
+        left_fqn      = self._fqn(schema, left_table)
+        right_fqn     = self._fqn(schema, right_table)
+        jc            = ", ".join(self._quote(c) for c in join_columns)
+        sample_clause = self._sample_clause(sample_size)
 
-        left_uniq  = self.execute_scalar(f"SELECT COUNT(DISTINCT {jc}) FROM {left_fqn}")
-        right_uniq = self.execute_scalar(f"SELECT COUNT(DISTINCT {jc}) FROM {right_fqn}")
-        left_total  = self.execute_scalar(f"SELECT COUNT(*) FROM {left_fqn}")
-        right_total = self.execute_scalar(f"SELECT COUNT(*) FROM {right_fqn}")
+        left_uniq   = self.execute_scalar(
+            f"SELECT COUNT(DISTINCT {jc}) FROM {left_fqn} {sample_clause}")
+        right_uniq  = self.execute_scalar(
+            f"SELECT COUNT(DISTINCT {jc}) FROM {right_fqn} {sample_clause}")
+        left_total  = self.execute_scalar(
+            f"SELECT COUNT(*) FROM {left_fqn} {sample_clause}")
+        right_total = self.execute_scalar(
+            f"SELECT COUNT(*) FROM {right_fqn} {sample_clause}")
 
         left_unique  = left_uniq  == left_total
         right_unique = right_uniq == right_total

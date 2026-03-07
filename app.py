@@ -94,6 +94,9 @@ api = APIClient(AGENT_API_URL)
 # ── Ontology API client (separate microservice) ────────────────────────────────
 ONTOLOGY_API_URL = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001").rstrip("/")
 
+# ── Knowledge Graph API client (separate microservice) ─────────────────────────
+KG_API_URL = os.environ.get("KG_API_URL", "http://localhost:8002").rstrip("/")
+
 
 class OntologyAPIClient:
     def __init__(self, base: str):
@@ -143,6 +146,49 @@ class OntologyAPIClient:
 
 
 onto_api = OntologyAPIClient(ONTOLOGY_API_URL)
+
+
+# ── Knowledge Graph API client ─────────────────────────────────────────────────
+class KGAPIClient:
+    def __init__(self, base: str):
+        self._base = base
+
+    def _check(self, r: "requests.Response") -> "requests.Response":
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
+        return r
+
+    def health(self) -> bool:
+        try:
+            return requests.get(f"{self._base}/health", timeout=5).status_code == 200
+        except Exception:
+            return False
+
+    def generate(self, payload: Dict) -> str:
+        r = self._check(requests.post(f"{self._base}/generate", json=payload, timeout=120))
+        return r.json()["job_id"]
+
+    def get_job(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}", timeout=30)).json()
+
+    def get_graph(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}/graph", timeout=30)).json()
+
+    def get_queries(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}/queries", timeout=30)).json()
+
+    def list_jobs(self) -> List[Dict]:
+        try:
+            return requests.get(f"{self._base}/list", timeout=10).json()
+        except Exception:
+            return []
+
+
+kg_api = KGAPIClient(KG_API_URL)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_META: Dict[str, Dict] = {
@@ -361,7 +407,8 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("last_run_id", None), ("last_run_meta", None),
                 ("running_job_id", None),
                 ("onto_job_id", None), ("onto_result", None),
-                ("onto_content", None), ("onto_last_job_id", None)]:
+                ("onto_content", None), ("onto_last_job_id", None),
+                ("kg_job_id", None), ("kg_result", None), ("kg_graph_data", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -375,7 +422,8 @@ def _sidebar() -> None:
             unsafe_allow_html=True,
         )
         # API status indicators
-        for label, checker in [("Agent API", api.health), ("Ontology API", onto_api.health)]:
+        for label, checker in [("Agent API", api.health), ("Ontology API", onto_api.health),
+                                ("KG API", kg_api.health)]:
             ok  = checker()
             dot = "🟢" if ok else "🔴"
             st.markdown(
@@ -388,7 +436,8 @@ def _sidebar() -> None:
         for key, icon, label in [("extract",  "⚡",  "New Extraction"),
                                    ("history",  "🗂️",  "History"),
                                    ("search",   "🔍", "Search Metadata"),
-                                   ("ontology", "🦉", "Ontology Generator")]:
+                                   ("ontology", "🦉", "Ontology Generator"),
+                                   ("kg",       "🕸️", "Knowledge Graph")]:
             active = st.session_state.page == key
             if st.button(
                 f"{icon}  {label}",
@@ -1151,6 +1200,351 @@ def _ontology_view() -> None:
                 st.markdown(f"- {err}")
 
 
+# ── Knowledge Graph view ───────────────────────────────────────────────────────
+_KG_NODES = [
+    ("parse",     "📂", "Parsing OWL ontology"),
+    ("translate", "🔄", "Translating to Cypher/Gremlin"),
+    ("execute",   "⚡", "Executing on graph database"),
+]
+
+
+def _kg_node_html(nodes_state: Dict[str, str]) -> str:
+    icons  = {n[0]: n[1] for n in _KG_NODES}
+    labels = {n[0]: n[2] for n in _KG_NODES}
+    items  = []
+    for name, _, _ in _KG_NODES:
+        s      = nodes_state.get(name, "pending")
+        prefix = {"running": "⟳ ", "done": "✓ ", "error": "✗ "}.get(s, "○ ")
+        items.append(
+            f'<div class="node-item node-{s}">'
+            f'{icons[name]} {prefix}{labels[name]}</div>'
+        )
+    return "<div>" + "".join(items) + "</div>"
+
+
+def _render_kg_graph(graph_data: Dict) -> None:
+    """Render the knowledge graph using pyvis embedded in an iframe."""
+    import streamlit.components.v1 as stc
+
+    nodes = graph_data.get("nodes", [])
+    edges = graph_data.get("edges", [])
+    if not nodes:
+        st.info("No nodes found in graph data.")
+        return
+
+    try:
+        from pyvis.network import Network
+    except ImportError:
+        st.warning("pyvis is not installed in the UI image. Rebuild with updated requirements.ui.txt.")
+        return
+
+    net = Network(height="620px", width="100%", bgcolor="#0a0e1a",
+                  font_color="#e2e8f0", directed=True)
+    net.set_options("""{
+      "physics": {
+        "forceAtlas2Based": {"gravitationalConstant": -30, "centralGravity": 0.003,
+                             "springLength": 200, "springConstant": 0.18},
+        "maxVelocity": 100, "solver": "forceAtlas2Based",
+        "timestep": 0.35, "stabilization": {"iterations": 180}
+      },
+      "nodes": {"borderWidth": 2, "font": {"size": 13, "color": "#e2e8f0"}},
+      "edges": {
+        "font": {"size": 11, "color": "#94a3b8", "strokeWidth": 0},
+        "smooth": {"type": "dynamic"},
+        "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}}
+      },
+      "interaction": {"hover": true, "tooltipDelay": 150, "zoomView": true, "dragView": true}
+    }""")
+
+    for node in nodes:
+        net.add_node(
+            node["id"],
+            label=node["label"],
+            title=node.get("title", ""),
+            color={"background": "#1e2740", "border": "#63b3ed",
+                   "highlight": {"background": "#2a3a5c", "border": "#93c5fd"}},
+            size=node.get("size", 20),
+            font={"color": "#e2e8f0"},
+        )
+
+    for edge in edges:
+        net.add_edge(
+            edge["from"], edge["to"],
+            label=edge.get("label", ""),
+            title=edge.get("title", ""),
+            color={"color": "#68d391", "highlight": "#a7f3d0"},
+        )
+
+    stc.html(net.generate_html(), height=630, scrolling=False)
+
+
+def _kg_view() -> None:
+    st.markdown(
+        '<div class="hero"><div class="hero-title">Knowledge Graph</div>'
+        '<div class="hero-sub">Convert an OWL ontology to Cypher (Neo4j) or Gremlin, '
+        'execute it on a live graph database, and explore the result interactively.</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not kg_api.health():
+        st.markdown(
+            f'<div class="banner-err">⚠ Knowledge Graph API is unreachable at {KG_API_URL}. '
+            f'Make sure the kg-api container is running.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    onto_jobs = [j for j in onto_api.list_jobs() if j.get("status") == "done"]
+    if not onto_jobs:
+        st.markdown(
+            '<div class="empty-state"><div class="empty-state-icon">🕸️</div>'
+            '<div class="empty-state-text">No ontologies available. '
+            'Generate an ontology in the Ontology Generator first.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Config panel ──────────────────────────────────────────────────────────
+    col_cfg, col_prog = st.columns([3, 2], gap="large")
+
+    with col_cfg:
+        st.markdown('<div class="sec-head">⚙️ Knowledge Graph Settings</div>', unsafe_allow_html=True)
+
+        onto_options = {
+            f'{j.get("ontology_name","Ontology")}  ·  '
+            f'{j.get("serialize_format","turtle").upper()}  ·  '
+            f'{j.get("class_count",0)} classes  ·  '
+            f'{j.get("triple_count",0)} triples': j["id"]
+            for j in onto_jobs
+        }
+        selected_onto_label = st.selectbox("Source ontology", list(onto_options.keys()))
+        onto_job_id = onto_options[selected_onto_label]
+
+        graph_type = st.radio("Target graph database", ["Neo4j (Cypher)", "Gremlin (TinkerPop)"],
+                              horizontal=True)
+        use_neo4j = graph_type.startswith("Neo4j")
+
+        st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
+
+        if use_neo4j:
+            neo4j_uri  = st.text_input("Neo4j Bolt URI", value="bolt://localhost:7687",
+                                       placeholder="bolt://localhost:7687")
+            c1, c2 = st.columns(2)
+            neo4j_user = c1.text_input("Username", value="neo4j")
+            neo4j_pass = c2.text_input("Password", type="password")
+            neo4j_db   = st.text_input("Database", value="neo4j")
+            gremlin_url = gremlin_src = ""
+        else:
+            gremlin_url = st.text_input("Gremlin WebSocket URL",
+                                        value="ws://localhost:8182/gremlin",
+                                        placeholder="ws://localhost:8182/gremlin")
+            gremlin_src = st.text_input("Traversal source", value="g")
+            neo4j_uri = neo4j_user = neo4j_pass = neo4j_db = ""
+
+        clear_existing = st.checkbox("Clear existing graph before loading", value=False)
+        execute_now    = st.checkbox("Execute on graph database (uncheck for preview only)",
+                                     value=True)
+
+        gen_btn = st.button(
+            "🕸️  Create Knowledge Graph", type="primary", use_container_width=True,
+            disabled=bool(st.session_state.kg_job_id),
+        )
+
+    # ── Progress panel ────────────────────────────────────────────────────────
+    with col_prog:
+        st.markdown('<div class="sec-head">📡 Pipeline Progress</div>', unsafe_allow_html=True)
+        prog_area  = st.empty()
+        error_area = st.empty()
+
+        job_id = st.session_state.kg_job_id
+        if job_id:
+            try:
+                status = kg_api.get_job(job_id)
+            except Exception as e:
+                error_area.markdown(
+                    f'<div class="banner-err">⚠ API error: {e}</div>', unsafe_allow_html=True)
+                st.session_state.kg_job_id = None
+                status = None
+
+            if status:
+                completed = set(status.get("completed_nodes") or [])
+                current   = status.get("current_node") or ""
+                ns_map    = {
+                    name: ("done"    if name in completed else
+                           "running" if name == current and status["status"] == "running" else
+                           "pending")
+                    for name, _, _ in _KG_NODES
+                }
+                prog_area.markdown(_kg_node_html(ns_map), unsafe_allow_html=True)
+
+                if status["status"] == "done":
+                    try:
+                        graph_data = kg_api.get_graph(job_id)
+                    except Exception:
+                        graph_data = {"nodes": [], "edges": []}
+                    st.session_state.kg_result     = status
+                    st.session_state.kg_graph_data = graph_data
+                    st.session_state.kg_job_id     = None
+                    st.balloons()
+                    st.rerun()
+                elif status["status"] == "error":
+                    for k in ns_map:
+                        if ns_map[k] == "running":
+                            ns_map[k] = "error"
+                    prog_area.markdown(_kg_node_html(ns_map), unsafe_allow_html=True)
+                    error_area.markdown(
+                        f'<div class="banner-err">⚠ Pipeline failed: '
+                        f'{status.get("error","unknown error")}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.session_state.kg_job_id = None
+                else:
+                    time.sleep(1.5)
+                    st.rerun()
+        else:
+            prog_area.markdown(_kg_node_html({n[0]: "pending" for n in _KG_NODES}),
+                               unsafe_allow_html=True)
+
+    # ── Trigger ───────────────────────────────────────────────────────────────
+    if gen_btn:
+        try:
+            onto_content = onto_api.get_content(onto_job_id)
+            ontology_text   = onto_content.get("content", "")
+            ontology_format = onto_content.get("format", "turtle")
+        except Exception as e:
+            st.error(f"Could not fetch ontology content: {e}")
+            return
+
+        payload = {
+            "ontology_text":   ontology_text,
+            "ontology_format": ontology_format,
+            "graph_type":      "neo4j" if use_neo4j else "gremlin",
+            "clear_existing":  clear_existing,
+        }
+        if use_neo4j and execute_now:
+            payload.update({
+                "neo4j_uri":      neo4j_uri.strip(),
+                "neo4j_username": neo4j_user.strip(),
+                "neo4j_password": neo4j_pass,
+                "neo4j_database": neo4j_db.strip() or "neo4j",
+            })
+        elif not use_neo4j and execute_now:
+            payload.update({
+                "gremlin_url":              gremlin_url.strip(),
+                "gremlin_traversal_source": gremlin_src.strip() or "g",
+            })
+
+        try:
+            jid = kg_api.generate(payload)
+            st.session_state.kg_job_id    = jid
+            st.session_state.kg_result    = None
+            st.session_state.kg_graph_data = None
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to start KG generation: {e}")
+        return
+
+    # ── Result panel ──────────────────────────────────────────────────────────
+    result     = st.session_state.kg_result
+    graph_data = st.session_state.kg_graph_data
+
+    if not result or st.session_state.kg_job_id:
+        # Show list of past KG jobs
+        done_jobs = [j for j in kg_api.list_jobs() if j.get("status") == "done"]
+        if done_jobs:
+            st.markdown(
+                "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div class="sec-head">📚 Previous Knowledge Graphs</div>',
+                        unsafe_allow_html=True)
+            for j in done_jobs:
+                cols = st.columns([7, 2])
+                with cols[0]:
+                    gtype = j.get("graph_type", "neo4j").upper()
+                    st.markdown(
+                        f'<div class="hcard">'
+                        f'<div class="hcard-title">🕸️ {gtype} Knowledge Graph</div>'
+                        f'<div class="hcard-meta">'
+                        f'{j.get("node_count",0)} nodes &nbsp;·&nbsp; '
+                        f'{j.get("edge_count",0)} edges &nbsp;·&nbsp; '
+                        f'{j.get("executed_count",0)} queries executed</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🔎 View", key=f"kg_view_{j['id']}"):
+                        try:
+                            gd = kg_api.get_graph(j["id"])
+                        except Exception:
+                            gd = {"nodes": [], "edges": []}
+                        st.session_state.kg_result     = j
+                        st.session_state.kg_graph_data = gd
+                        st.rerun()
+        return
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    executed = result.get("executed_count", 0)
+    mode_lbl = f"{executed} queries executed" if executed else "Preview mode (no DB execution)"
+    st.markdown(
+        f'<div class="banner-ok" style="margin-bottom:1rem">✓ Knowledge graph ready — {mode_lbl}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="stat-row">'
+        + _stat_card(result.get("node_count", 0), "Graph Nodes",    "#63b3ed")
+        + _stat_card(result.get("edge_count",  0), "Graph Edges",   "#68d391")
+        + _stat_card(result.get("executed_count", 0), "Queries Run", "#b794f4")
+        + _stat_card(result.get("graph_type","?").upper(), "DB Type", "#f6ad55")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Interactive graph ─────────────────────────────────────────────────────
+    st.markdown('<div class="sec-head" style="margin-top:1.5rem">🕸️ Graph Visualisation</div>',
+                unsafe_allow_html=True)
+    st.caption("Pan: drag · Zoom: scroll · Hover nodes/edges for details.")
+
+    if graph_data:
+        _render_kg_graph(graph_data)
+    else:
+        st.info("No graph data available.")
+
+    # ── Generated queries ─────────────────────────────────────────────────────
+    if st.session_state.kg_result:
+        job_id_for_queries = (
+            st.session_state.kg_result.get("id") or
+            next((j["id"] for j in kg_api.list_jobs()
+                  if j.get("status") == "done"), None)
+        )
+        if job_id_for_queries:
+            with st.expander("📋 View generated queries", expanded=False):
+                try:
+                    q_data = kg_api.get_queries(job_id_for_queries)
+                    q_list = q_data.get("queries", [])
+                    lang   = "cypher" if q_data.get("graph_type") == "neo4j" else "text"
+                    st.caption(f"{len(q_list)} {q_data.get('graph_type','').upper()} statements")
+                    st.code("\n\n".join(q_list), language=lang)
+                    st.download_button(
+                        "⬇ Download queries",
+                        data="\n\n".join(q_list),
+                        file_name=f"kg_queries_{q_data.get('graph_type','kg')}.{'cypher' if lang=='cypher' else 'groovy'}",
+                        mime="text/plain",
+                        use_container_width=False,
+                    )
+                except Exception as e:
+                    st.warning(f"Could not fetch queries: {e}")
+
+    if result.get("errors"):
+        with st.expander(f"⚠ {len(result['errors'])} warning(s)"):
+            for err in result["errors"]:
+                st.markdown(f"- {err}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     _inject_css()
@@ -1164,6 +1558,8 @@ def main() -> None:
         _search_view()
     elif page == "ontology":
         _ontology_view()
+    elif page == "kg":
+        _kg_view()
 
 
 if __name__ == "__main__":

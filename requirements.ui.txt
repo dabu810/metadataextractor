@@ -1,3 +1,6 @@
 # Streamlit UI — lightweight, no agent dependencies
 streamlit>=1.35.0
 requests>=2.31.0
+
+# Interactive graph visualisation for the Knowledge Graph view
+pyvis>=0.3.2

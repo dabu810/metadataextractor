@@ -53,6 +53,28 @@ services:
     networks:
       - metadata-net
 
+  # ── Knowledge Graph API ────────────────────────────────────────────────────────
+  kg-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.kg
+    image: metadata-kg-api:latest
+    container_name: metadata-kg-api
+    restart: unless-stopped
+    ports:
+      - "${KG_PORT:-8002}:8002"
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - metadata-net
+
   # ── Streamlit UI ──────────────────────────────────────────────────────────────
   ui:
     build:
@@ -67,11 +89,14 @@ services:
       # Must match service names above so Docker DNS resolves them
       AGENT_API_URL:    "http://agent-api:8000"
       ONTOLOGY_API_URL: "http://ontology-api:8001"
+      KG_API_URL:       "http://kg-api:8002"
     depends_on:
       agent-api:
         condition: service_healthy
       ontology-api:
-        condition: service_healthy
+        condition: service_started
+      kg-api:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]

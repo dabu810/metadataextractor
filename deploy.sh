@@ -35,10 +35,12 @@ ENV_FILE="${SCRIPT_DIR}/.env"
 
 AGENT_IMAGE="metadata-agent-api:latest"
 ONTOLOGY_IMAGE="metadata-ontology-api:latest"
+KG_IMAGE="metadata-kg-api:latest"
 UI_IMAGE="metadata-agent-ui:latest"
 
 AGENT_PORT="${AGENT_PORT:-8000}"
 ONTOLOGY_PORT="${ONTOLOGY_PORT:-8001}"
+KG_PORT="${KG_PORT:-8002}"
 UI_PORT="${UI_PORT:-8501}"
 
 HEALTH_TIMEOUT=90   # seconds to wait for healthy status
@@ -60,6 +62,7 @@ print_banner() {
     echo -e "${RESET}"
     echo -e "  Agent API    → ${CYAN}http://localhost:${AGENT_PORT}${RESET}"
     echo -e "  Ontology API → ${CYAN}http://localhost:${ONTOLOGY_PORT}${RESET}"
+    echo -e "  KG API       → ${CYAN}http://localhost:${KG_PORT}${RESET}"
     echo -e "  UI           → ${CYAN}http://localhost:${UI_PORT}${RESET}"
     echo ""
 }
@@ -126,6 +129,13 @@ cmd_build() {
         "${SCRIPT_DIR}"
     success "Built ${ONTOLOGY_IMAGE}"
 
+    info "Building kg-api image…"
+    docker build \
+        --file "${SCRIPT_DIR}/Dockerfile.kg" \
+        --tag  "${KG_IMAGE}" \
+        "${SCRIPT_DIR}"
+    success "Built ${KG_IMAGE}"
+
     info "Building ui image…"
     docker build \
         --file "${SCRIPT_DIR}/Dockerfile.ui" \
@@ -141,6 +151,7 @@ cmd_start() {
     echo ""
     wait_healthy "agent-api"    "http://localhost:${AGENT_PORT}/health"
     wait_healthy "ontology-api" "http://localhost:${ONTOLOGY_PORT}/health"
+    wait_healthy "kg-api"       "http://localhost:${KG_PORT}/health"
     wait_healthy "ui"           "http://localhost:${UI_PORT}/_stcore/health"
 
     echo ""
@@ -150,6 +161,8 @@ cmd_start() {
     echo -e "  ${BOLD}Agent Docs   ${RESET} →  ${CYAN}http://localhost:${AGENT_PORT}/docs${RESET}"
     echo -e "  ${BOLD}Ontology API ${RESET} →  ${CYAN}http://localhost:${ONTOLOGY_PORT}${RESET}"
     echo -e "  ${BOLD}Ontology Docs${RESET} →  ${CYAN}http://localhost:${ONTOLOGY_PORT}/docs${RESET}"
+    echo -e "  ${BOLD}KG API       ${RESET} →  ${CYAN}http://localhost:${KG_PORT}${RESET}"
+    echo -e "  ${BOLD}KG Docs      ${RESET} →  ${CYAN}http://localhost:${KG_PORT}/docs${RESET}"
     echo -e "  ${BOLD}UI           ${RESET} →  ${CYAN}http://localhost:${UI_PORT}${RESET}"
     echo ""
 }
@@ -178,6 +191,7 @@ cmd_restart() {
     echo ""
     wait_healthy "agent-api"    "http://localhost:${AGENT_PORT}/health"
     wait_healthy "ontology-api" "http://localhost:${ONTOLOGY_PORT}/health"
+    wait_healthy "kg-api"       "http://localhost:${KG_PORT}/health"
     success "Services restarted."
 }
 
@@ -205,6 +219,7 @@ cmd_help() {
     echo "  ANTHROPIC_API_KEY   Required for LLM Q&A features"
     echo "  AGENT_PORT          Agent API port      (default: 8000)"
     echo "  ONTOLOGY_PORT       Ontology API port   (default: 8001)"
+    echo "  KG_PORT             KG API port         (default: 8002)"
     echo "  UI_PORT             Streamlit UI port   (default: 8501)"
     echo "  LOG_LEVEL           debug | info | warning (default: info)"
     echo ""

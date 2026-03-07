@@ -6,12 +6,13 @@
 2. [Architecture](#architecture)
 3. [Metadata Extraction Agent](#metadata-extraction-agent)
 4. [Ontology Agent](#ontology-agent)
-5. [API Services](#api-services)
-6. [Streamlit UI](#streamlit-ui)
-7. [Docker Setup](#docker-setup)
-8. [Deployment](#deployment)
-9. [Data Flow](#data-flow)
-10. [Configuration Reference](#configuration-reference)
+5. [Knowledge Graph Agent](#knowledge-graph-agent)
+6. [API Services](#api-services)
+7. [Streamlit UI](#streamlit-ui)
+8. [Docker Setup](#docker-setup)
+9. [Deployment](#deployment)
+10. [Data Flow](#data-flow)
+11. [Configuration Reference](#configuration-reference)
 
 ---
 
@@ -19,56 +20,63 @@
 
 The Metadata Agent is a multi-container system that connects to a database, automatically extracts its full schema and statistical metadata, discovers implicit data relationships, and generates a machine-readable OWL/RDF ontology from the results.
 
-The system is built on two independently deployable AI agents:
+The system is built on three independently deployable AI agents:
 
 | Agent | Purpose | Port |
 |---|---|---|
 | **Metadata Extraction Agent** | Connects to a database and extracts schema, statistics, functional dependencies, inclusion dependencies, and cardinality relationships | 8000 |
 | **Ontology Agent** | Reads a metadata report and generates a formal OWL/RDF ontology in Turtle, RDF/XML, or N3 format | 8001 |
-| **Streamlit UI** | Web interface for running extractions, browsing history, searching metadata, and generating/editing ontologies | 8501 |
+| **Knowledge Graph Agent** | Converts an OWL/RDF ontology to Cypher (Neo4j) or Gremlin (TinkerPop), optionally executes on a live graph database, and returns interactive graph data for the UI | 8002 |
+| **Streamlit UI** | Web interface for extractions, history, search, ontology generation/editing, and knowledge graph creation/visualisation | 8501 |
 
-The two agents are **completely decoupled**: the ontology agent has zero imports from the metadata agent package. They share only a JSON contract — the metadata report format.
+All three agents are **completely decoupled**: each has zero imports from the others. They communicate only through JSON contracts passed via the UI.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Docker Network: metadata-net               │
-│                                                                     │
-│  ┌──────────────┐   HTTP    ┌──────────────────┐                   │
-│  │  Streamlit   │ ────────► │  agent-api       │  port 8000        │
-│  │  UI          │           │  (FastAPI)        │                   │
-│  │  port 8501   │           │  metadata_agent/  │                   │
-│  │              │ ────────► │  api.py           │                   │
-│  │              │   HTTP    └──────────────────┘                   │
-│  │              │                    │                              │
-│  │              │           shared Docker volume: reports_data      │
-│  │              │                    │                              │
-│  │              │   HTTP    ┌──────────────────┐                   │
-│  │              │ ────────► │  ontology-api    │  port 8001        │
-│  │              │           │  (FastAPI)        │                   │
-│  └──────────────┘           │  ontology_api.py  │                   │
-│                             └──────────────────┘                   │
-└─────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────┐
-                    │  Target Database             │
-                    │  PostgreSQL / Oracle /       │
-                    │  SQL Server / Teradata /     │
-                    │  Redshift / BigQuery /       │
-                    │  Delta Lake                  │
-                    └─────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          Docker Network: metadata-net                    │
+│                                                                          │
+│  ┌──────────────┐  HTTP   ┌──────────────────┐                          │
+│  │  Streamlit   │ ──────► │  agent-api       │  port 8000               │
+│  │  UI          │         │  (FastAPI)        │                          │
+│  │  port 8501   │         │  metadata_agent/  │                          │
+│  │              │  HTTP   │  api.py           │                          │
+│  │              │ ──────► └──────────────────┘                          │
+│  │              │                  │                                     │
+│  │              │         shared Docker volume: reports_data             │
+│  │              │                  │                                     │
+│  │              │  HTTP   ┌──────────────────┐                          │
+│  │              │ ──────► │  ontology-api    │  port 8001               │
+│  │              │         │  (FastAPI)        │                          │
+│  │              │         │  ontology_api.py  │                          │
+│  │              │  HTTP   └──────────────────┘                          │
+│  │              │ ──────► ┌──────────────────┐                          │
+│  │              │         │  kg-api          │  port 8002               │
+│  └──────────────┘         │  (FastAPI)        │                          │
+│                           │  kg_api.py        │                          │
+│                           └──────────────────┘                          │
+└──────────────────────────────────────────────────────────────────────────┘
+         │                                              │
+         ▼                                              ▼
+┌─────────────────────┐                  ┌──────────────────────────┐
+│  Source Database     │                  │  Target Graph Database   │
+│  PostgreSQL / Oracle │                  │  Neo4j (bolt://)  or     │
+│  SQL Server /        │                  │  Gremlin Server (ws://)  │
+│  Teradata / Redshift │                  └──────────────────────────┘
+│  BigQuery / Delta    │
+└─────────────────────┘
 ```
 
 **Key design decisions:**
 
-- The UI is the orchestrator for ontology generation — it fetches the report from `agent-api` and sends it to `ontology-api`. The two backend services never talk to each other.
-- Reports and ontology files are written to a named Docker volume (`reports_data`) mounted by both `agent-api` and `ontology-api`, so files written by one service can be served by the other.
+- The UI is the orchestrator for all cross-service workflows. It fetches results from one service and sends them to the next. The backend services never talk to each other.
+- For knowledge graph creation: the UI fetches the ontology text from `ontology-api` and sends it to `kg-api`. The `kg-api` connects directly to the user's Neo4j or Gremlin server.
+- Reports and ontology files are written to a named Docker volume (`reports_data`) mounted by both `agent-api` and `ontology-api`. The `kg-api` does not need the volume — it operates entirely in-memory.
 - All inter-service communication uses Docker's internal DNS (service names, not `localhost`).
-- Both API services expose a `/health` endpoint and use FastAPI `BackgroundTasks` for non-blocking job execution.
+- All API services expose a `/health` endpoint and use FastAPI `BackgroundTasks` for non-blocking job execution.
 
 ---
 
@@ -473,6 +481,172 @@ URI fragments are sanitized by `_safe(name)` which replaces non-alphanumeric cha
 
 ---
 
+## Knowledge Graph Agent
+
+### Package Structure
+
+```
+knowledge_graph_agent/
+├── __init__.py               # Exports: KGAgent, KGConfig
+├── config.py                 # KGConfig dataclass
+├── state.py                  # KGState TypedDict
+├── agent.py                  # LangGraph graph definition + KGAgent class
+└── nodes/
+    ├── __init__.py
+    ├── parse_node.py         # Parse OWL/Turtle with rdflib into a Graph object
+    ├── translate_node.py     # Convert OWL graph to Cypher or Gremlin statements
+    └── execute_node.py       # Execute statements on Neo4j or Gremlin server
+```
+
+This package has **zero imports** from `metadata_agent` or `ontology_agent`. Its only input is a raw ontology string (Turtle, RDF/XML, or N3).
+
+### Configuration
+
+```python
+# knowledge_graph_agent/config.py
+
+@dataclass
+class KGConfig:
+    graph_type: str = "neo4j"              # "neo4j" | "gremlin"
+
+    # Neo4j — empty uri = skip execution (preview/translate-only mode)
+    neo4j_uri:      str = ""               # e.g. "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = ""
+    neo4j_database: str = "neo4j"
+
+    # Gremlin — empty url = skip execution
+    gremlin_url:              str = ""     # e.g. "ws://localhost:8182/gremlin"
+    gremlin_traversal_source: str = "g"
+
+    clear_existing: bool = False           # Drop all vertices/edges before loading
+    batch_size:     int  = 50             # Queries per batch
+```
+
+### State
+
+```python
+# knowledge_graph_agent/state.py
+
+class KGState(TypedDict, total=False):
+    config:            Any        # KGConfig instance
+    ontology_text:     str        # Raw ontology string
+    ontology_format:   str        # "turtle" | "xml" | "n3"
+    ontology_graph:    Any        # rdflib.Graph after parsing
+    queries:           List[str]  # Generated Cypher or Gremlin statements
+    graph_data:        Dict       # {nodes: [...], edges: [...]} for UI visualisation
+    execution_results: List[Dict] # Per-query execution summaries
+    node_count:        int        # OWL classes → graph nodes
+    edge_count:        int        # OWL object properties → graph edges
+    executed_count:    int        # Successfully executed query count
+    errors:            List[str]
+    phase:             str        # "init"|"parsed"|"translated"|"executed"|"error"
+```
+
+### LangGraph Pipeline
+
+```
+START
+  │
+  ▼
+parse_node         Parses ontology_text with rdflib into an rdflib.Graph.
+  │                Validates non-empty. Sets ontology_graph.
+  │
+  ├── error? ──► error_end ──► END
+  │
+  ▼
+translate_node     Extracts owl:Class, owl:DatatypeProperty, owl:ObjectProperty
+  │                from the rdflib graph. Generates queries and graph_data.
+  │
+  ├── error? ──► error_end ──► END
+  │
+  ▼
+execute_node       If connection URI is non-empty: connects to Neo4j or Gremlin
+  │                and executes all queries. If URI is empty, skips gracefully
+  │                (preview / translate-only mode — graph_data still returned).
+  │
+  ▼
+END
+```
+
+### OWL → Graph Mapping
+
+| OWL element | Graph representation |
+|---|---|
+| `owl:Class` | Vertex/node with label = class name, `uri` property = full URI |
+| `owl:DatatypeProperty` | Node property attribute (xsd type stored as metadata) |
+| `owl:ObjectProperty` | Directed edge between two class nodes |
+| `owl:FunctionalProperty` on ObjectProperty | Edge annotated `cardinality=1:N` |
+| `owl:FunctionalProperty` + `owl:InverseFunctionalProperty` | Edge annotated `cardinality=1:1` |
+| `rdfs:comment` | Node/edge description / tooltip in `graph_data` |
+| `rdfs:label` | Human-readable name used as vertex/edge label |
+
+### Cypher Generation (Neo4j)
+
+Each `owl:Class` becomes a `MERGE` statement creating a node with two labels: `KGNode` (for constraint queries) and the class name (for type-specific queries):
+
+```cypher
+CREATE CONSTRAINT kg_node_uri IF NOT EXISTS FOR (n:KGNode) REQUIRE n.uri IS UNIQUE
+
+MERGE (n:KGNode:Orders {uri: 'http://...#orders', name: 'orders', type: 'owl:Class'})
+ON CREATE SET n.order_id_xsd_type = 'integer', n.order_date_xsd_type = 'dateTime'
+
+MATCH (a:KGNode {uri: '...#orders'}), (b:KGNode {uri: '...#customers'})
+MERGE (a)-[r:FK_CUSTOMERS {name: 'orders_fk_customers', type: 'owl:ObjectProperty', cardinality: '1:N'}]->(b)
+```
+
+### Gremlin Generation (TinkerPop)
+
+Each class becomes an upsert `coalesce` statement; each object property becomes an `addE` with upsert:
+
+```groovy
+g.V().has('uri', '...#orders').fold().coalesce(unfold(),
+  addV('orders').property('uri','...#orders').property('name','orders')
+  .property('order_id_xsd_type','integer')).next()
+
+g.V().has('uri', '...#orders').as('a')
+  .V().has('uri', '...#customers')
+  .coalesce(
+    inE('FK_CUSTOMERS').where(outV().as('a')),
+    addE('FK_CUSTOMERS').from('a').property('type','owl:ObjectProperty').property('cardinality','1:N')
+  ).next()
+```
+
+### Preview Mode
+
+If `neo4j_uri` (or `gremlin_url`) is left empty in the request, the `execute_node` skips DB connection entirely. The API still returns `graph_data` and `queries` — useful for:
+- Previewing the generated schema before committing to a live DB
+- Downloading the query file for manual execution
+- Visualising the ontology structure without a running graph server
+
+### graph_data Format
+
+```json
+{
+  "nodes": [
+    {
+      "id":    "http://metadata-agent.io/ontology/DatabaseOntology/orders",
+      "label": "orders",
+      "title": "Class: orders\nrow_count=50000\n\nProperties:\n  order_id: integer\n  order_date: dateTime",
+      "color": "#63b3ed",
+      "size":  28
+    }
+  ],
+  "edges": [
+    {
+      "from":  "http://...#orders",
+      "to":    "http://...#customers",
+      "label": "orders_fk_customers (FK)",
+      "title": "orders_fk_customers (1:N)\ncoverage=0.998"
+    }
+  ]
+}
+```
+
+Node size scales with the number of datatype properties (more columns → larger node). This gives an immediate visual indication of table complexity.
+
+---
+
 ## API Services
 
 ### Metadata Extraction API (`api.py`, port 8000)
@@ -531,6 +705,44 @@ def _ask_llm(report: Dict, question: str) -> str:
 ```
 
 The LLM is called directly (not via a full agent graph) to keep the Q&A endpoint fast and avoid unnecessary overhead.
+
+### Knowledge Graph API (`kg_api.py`, port 8002)
+
+Completely standalone FastAPI service. Accepts a raw ontology string, runs the KG pipeline, and returns graph data for visualisation plus the generated queries.
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/generate` | Start async KG creation → `{"job_id": "..."}` (HTTP 202) |
+| `GET` | `/jobs/{job_id}` | Poll status — returns node_count, edge_count, executed_count |
+| `GET` | `/jobs/{job_id}/graph` | Fetch `{nodes, edges}` for UI visualisation |
+| `GET` | `/jobs/{job_id}/queries` | Fetch `{graph_type, queries, count}` — the raw statements |
+| `GET` | `/list` | List all KG jobs |
+
+**Generate request body:**
+```json
+{
+  "ontology_text":             "...",
+  "ontology_format":           "turtle",
+  "graph_type":                "neo4j",
+  "neo4j_uri":                 "bolt://localhost:7687",
+  "neo4j_username":            "neo4j",
+  "neo4j_password":            "secret",
+  "neo4j_database":            "neo4j",
+  "gremlin_url":               "",
+  "gremlin_traversal_source":  "g",
+  "clear_existing":            false
+}
+```
+
+Leave `neo4j_uri` (and `gremlin_url`) empty to run in **preview mode** — only parse + translate, no DB connection.
+
+**Job record (in-memory):**
+The `_jobs` dict stores per-job: status, completed_nodes, current_node, node_count, edge_count, executed_count, graph_data, queries, execution_results, errors. The large `graph_data` and `queries` blobs are excluded from the `/jobs/{id}` poll response and only returned on dedicated endpoints.
+
+---
 
 ### Ontology API (`ontology_api.py`, port 8001)
 
@@ -601,6 +813,27 @@ onto_api = OntologyAPIClient(ONTOLOGY_API_URL)  # for ontology generation and ma
 | `onto_content` | Cached ontology text for the editor (avoids redundant API calls) |
 | `onto_last_job_id` | Job ID whose content is cached in `onto_content` |
 
+### API Clients
+
+```python
+api      = APIClient(AGENT_API_URL)          # extraction, history, search, Q&A
+onto_api = OntologyAPIClient(ONTOLOGY_API_URL)  # ontology generation and management
+kg_api   = KGAPIClient(KG_API_URL)           # knowledge graph creation and visualisation
+```
+
+All three clients extract FastAPI `detail` fields from error responses for meaningful error messages.
+
+**`KGAPIClient` methods:**
+
+| Method | HTTP call | Returns |
+|---|---|---|
+| `health()` | `GET /health` | `bool` |
+| `generate(payload)` | `POST /generate` | `job_id: str` |
+| `get_job(job_id)` | `GET /jobs/{id}` | status dict |
+| `get_graph(job_id)` | `GET /jobs/{id}/graph` | `{nodes, edges}` |
+| `get_queries(job_id)` | `GET /jobs/{id}/queries` | `{graph_type, queries, count}` |
+| `list_jobs()` | `GET /list` | `List[Dict]` |
+
 ### Views
 
 **1. Extract — `_extract_view()`**
@@ -627,6 +860,33 @@ onto_api = OntologyAPIClient(ONTOLOGY_API_URL)  # for ontology generation and ma
 - Calls `api.search(q, scope, db_type)` and renders grouped results.
 - Each result shows: match type badge, matched name, context (database/schema/date), detail.
 
+**5. Knowledge Graph — `_kg_view()`**
+
+- Health check: if `kg_api.health()` returns `False`, shows error banner.
+- Ontology selector: dropdown of completed ontology jobs from `onto_api.list_jobs()`.
+- Graph type radio: Neo4j (Cypher) or Gremlin (TinkerPop).
+- Connection form: bolt URI / WebSocket URL, credentials, database name.
+- Preview toggle: when unchecked, connection fields are ignored and only parse+translate runs.
+- Clear existing checkbox: drops all vertices/edges before loading.
+- On "Create Knowledge Graph":
+  1. Fetches ontology text via `onto_api.get_content(onto_job_id)`.
+  2. POSTs to `kg_api.generate({ontology_text, graph_type, connection_params})`.
+  3. Polls `kg_api.get_job(job_id)` with 3-node progress tracker (parse → translate → execute).
+- On completion:
+  - Stat cards: Graph Nodes, Graph Edges, Queries Run, DB Type.
+  - Interactive graph via `_render_kg_graph(graph_data)` using pyvis + `st.components.v1.html()`.
+  - Expandable queries panel: shows raw Cypher/Gremlin with syntax highlighting + download button.
+  - Previous KG jobs listed with "View" buttons.
+
+**Graph rendering (`_render_kg_graph`):**
+
+Uses `pyvis.network.Network` to build an in-memory interactive network graph:
+- Nodes: dark blue fill (`#1e2740`), blue border (`#63b3ed`), white label, scaled by property count.
+- Edges: green (`#68d391`) directed arrows, labelled with property name.
+- Physics: ForceAtlas2 layout for natural graph spreading.
+- Interaction: zoom, pan, hover tooltips (class metadata on nodes, cardinality on edges).
+- Rendered via `st.components.v1.html(net.generate_html(), height=630)`.
+
 **4. Ontology Generator — `_ontology_view()`**
 
 - Health check: if `onto_api.health()` returns `False`, shows an error banner and exits early.
@@ -649,6 +909,25 @@ onto_api = OntologyAPIClient(ONTOLOGY_API_URL)  # for ontology generation and ma
 ## Docker Setup
 
 ### Three Dockerfiles
+
+**`Dockerfile.kg`** — Knowledge Graph API
+
+```
+Stage 1 (builder):
+  - python:3.11-slim
+  - pip install -r requirements.kg.txt into /install
+
+Stage 2 (runtime):
+  - python:3.11-slim
+  - Non-root user: agent:agent
+  - Copies /install from builder
+  - Copies knowledge_graph_agent/ package only
+  - Copies kg_api.py (FastAPI entry point)
+  - No shared volume — KG agent is stateless (in-memory job store)
+  - Exposes port 8002
+  - Healthcheck: urllib.request to /health
+  - CMD: uvicorn kg_api:app --host 0.0.0.0 --port 8002
+```
 
 **`Dockerfile.agent`** — Metadata Extraction API
 
@@ -734,6 +1013,18 @@ services:
       interval: 15s  timeout: 5s  retries: 5  start_period: 15s
     networks: [metadata-net]
 
+  kg-api:
+    build: { dockerfile: Dockerfile.kg }
+    image: metadata-kg-api:latest
+    ports: ["${KG_PORT:-8002}:8002"]
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: [python -c "urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 15s  timeout: 5s  retries: 5  start_period: 15s
+    networks: [metadata-net]
+    # No volume — KGAgent is stateless; it connects directly to user's Neo4j/Gremlin server
+
   ui:
     build: { dockerfile: Dockerfile.ui }
     image: metadata-agent-ui:latest
@@ -756,10 +1047,11 @@ networks:
 ```
 
 **Key points:**
-- `reports_data` is a named Docker volume mounted by both `agent-api` (writes reports + reads them for Q&A/history) and `ontology-api` (writes ontology files + serves downloads).
+- `reports_data` is a named Docker volume mounted by `agent-api` (writes reports, reads them for Q&A/history) and `ontology-api` (writes ontology files, serves downloads). The `kg-api` does not mount any volume — it is stateless.
 - The UI does not mount the volume — it accesses all files via HTTP API calls.
-- `depends_on` with `service_healthy` ensures the UI does not start until both backend APIs pass their healthchecks.
-- Docker's internal DNS allows the UI to address `http://agent-api:8000` and `http://ontology-api:8001` by service name.
+- `agent-api` uses `condition: service_healthy` (the UI fundamentally requires it). `ontology-api` and `kg-api` use `condition: service_started` so the UI is not blocked if those services are slow to initialize.
+- Docker's internal DNS allows the UI to address all three APIs by service name: `http://agent-api:8000`, `http://ontology-api:8001`, `http://kg-api:8002`.
+- The `kg-api` connects directly to the user's Neo4j or Gremlin server (outside Docker) using the URI/URL provided at request time — it is not configured at deploy time.
 
 ### Requirements Files
 
@@ -767,7 +1059,8 @@ networks:
 |---|---|
 | `requirements.agent.txt` | fastapi, uvicorn, pydantic, langchain-anthropic, langchain-core, langgraph, rdflib, psycopg2-binary, cx_Oracle, pyodbc, teradatasql, google-cloud-bigquery, pyspark |
 | `requirements.ontology.txt` | fastapi, uvicorn, pydantic, rdflib, langgraph, langchain-core |
-| `requirements.ui.txt` | streamlit, requests |
+| `requirements.kg.txt` | fastapi, uvicorn, pydantic, rdflib, langgraph, langchain-core, neo4j, gremlinpython |
+| `requirements.ui.txt` | streamlit, requests, pyvis |
 
 ---
 
@@ -805,6 +1098,7 @@ After starting containers, the script polls each service's health endpoint until
 | `ANTHROPIC_API_KEY` | — | Required for LLM Q&A features |
 | `AGENT_PORT` | 8000 | Host port for the metadata extraction API |
 | `ONTOLOGY_PORT` | 8001 | Host port for the ontology API |
+| `KG_PORT` | 8002 | Host port for the knowledge graph API |
 | `UI_PORT` | 8501 | Host port for the Streamlit UI |
 | `LOG_LEVEL` | info | Log verbosity: debug / info / warning |
 
@@ -825,7 +1119,10 @@ open http://localhost:8501
 # 4. View API docs
 open http://localhost:8000/docs    # Metadata Extraction API
 open http://localhost:8001/docs    # Ontology API
+open http://localhost:8002/docs    # Knowledge Graph API
 ```
+
+**Note:** The Knowledge Graph API connects to your Neo4j or Gremlin server at request time. You provide the connection URI in the UI when creating a knowledge graph — no configuration is needed at deploy time. Ensure Neo4j or your Gremlin server is reachable from the Docker network (use `host.docker.internal` instead of `localhost` when the DB is on the host machine).
 
 ### Running Locally Without Docker
 
@@ -839,9 +1136,13 @@ uvicorn api:app --port 8000 --reload
 export DATA_DIR=./reports
 uvicorn ontology_api:app --port 8001 --reload
 
-# Terminal 3 — Streamlit UI
+# Terminal 3 — Knowledge Graph API
+uvicorn kg_api:app --port 8002 --reload
+
+# Terminal 4 — Streamlit UI
 export AGENT_API_URL=http://localhost:8000
 export ONTOLOGY_API_URL=http://localhost:8001
+export KG_API_URL=http://localhost:8002
 streamlit run app.py
 ```
 
@@ -876,6 +1177,31 @@ UI polls GET /jobs/{job_id} every 1.5s
   → renders 5-node progress tracker
   → on status=done: fetches GET /jobs/{job_id}/report
   → renders result panel
+```
+
+### Knowledge Graph Creation Flow
+
+```
+User selects a completed ontology in Knowledge Graph view
+  │  Chooses Neo4j or Gremlin, enters connection details
+  │
+  ▼
+UI: GET /jobs/{onto_job_id}/content  (ontology-api:8001)
+  │  Returns the raw ontology text
+  │
+  ▼
+UI: POST /generate  (kg-api:8002)
+  │  Body: { ontology_text, graph_type, neo4j_uri/gremlin_url, ... }
+  │  Returns: { job_id: "..." }
+  │
+  ▼
+_run_kg() [background thread in kg-api]
+  ├── parse_node      → rdflib.Graph
+  ├── translate_node  → Cypher/Gremlin statements + graph_data
+  └── execute_node    → runs queries on Neo4j/Gremlin (skipped in preview mode)
+
+UI polls GET /jobs/{job_id} every 1.5s
+  → on done: GET /jobs/{job_id}/graph → renders pyvis network + stats + queries
 ```
 
 ### Ontology Generation Flow

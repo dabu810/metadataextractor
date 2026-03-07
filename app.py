@@ -40,8 +40,13 @@ class APIClient:
         return r.json()
 
     def _post(self, path: str, payload: Dict) -> Any:
-        r = requests.post(f"{self._base}{path}", json=payload, timeout=60)
-        r.raise_for_status()
+        r = requests.post(f"{self._base}{path}", json=payload, timeout=120)
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
         return r.json()
 
     def _delete(self, path: str) -> Any:

@@ -175,10 +175,23 @@ def _load_report_from_path(path: str) -> Dict:
 
 # ── Helper: LLM ask ───────────────────────────────────────────────────────────
 def _ask_llm(report: Dict, question: str) -> str:
-    dummy_cfg = AgentConfig(db_config=DBConfig(db_type=DBType("postgres")))
-    agent = MetadataExtractionAgent(dummy_cfg)
-    agent._report = report
-    return agent.ask(question)
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    if not report:
+        return "No report available — run an extraction first."
+
+    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0.0)
+    system = SystemMessage(content=(
+        "You are a data engineering expert. You have been provided the full "
+        "metadata report from a database schema scan. Answer questions about "
+        "the schema structure, data quality, and relationships concisely and accurately.\n\n"
+        "METADATA REPORT (JSON):\n"
+        + json.dumps(report, indent=2, default=str)[:40_000]
+    ))
+    human = HumanMessage(content=question)
+    response = llm.invoke([system, human])
+    return response.content
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────

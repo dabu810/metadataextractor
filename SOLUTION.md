@@ -7,12 +7,13 @@
 3. [Metadata Extraction Agent](#metadata-extraction-agent)
 4. [Ontology Agent](#ontology-agent)
 5. [Knowledge Graph Agent](#knowledge-graph-agent)
-6. [API Services](#api-services)
-7. [Streamlit UI](#streamlit-ui)
-8. [Docker Setup](#docker-setup)
-9. [Deployment](#deployment)
-10. [Data Flow](#data-flow)
-11. [Configuration Reference](#configuration-reference)
+6. [Dialog with Data Agent](#dialog-with-data-agent)
+7. [API Services](#api-services)
+8. [Streamlit UI](#streamlit-ui)
+9. [Docker Setup](#docker-setup)
+10. [Deployment](#deployment)
+11. [Data Flow](#data-flow)
+12. [Configuration Reference](#configuration-reference)
 
 ---
 
@@ -20,16 +21,17 @@
 
 The Metadata Agent is a multi-container system that connects to a database, automatically extracts its full schema and statistical metadata, discovers implicit data relationships, and generates a machine-readable OWL/RDF ontology from the results.
 
-The system is built on three independently deployable AI agents:
+The system is built on four independently deployable AI agents:
 
 | Agent | Purpose | Port |
 |---|---|---|
 | **Metadata Extraction Agent** | Connects to a database and extracts schema, statistics, functional dependencies, inclusion dependencies, and cardinality relationships | 8000 |
 | **Ontology Agent** | Reads a metadata report and generates a formal OWL/RDF ontology in Turtle, RDF/XML, or N3 format | 8001 |
 | **Knowledge Graph Agent** | Converts an OWL/RDF ontology to Cypher (Neo4j) or Gremlin (TinkerPop), optionally executes on a live graph database, and returns interactive graph data for the UI | 8002 |
-| **Streamlit UI** | Web interface for extractions, history, search, ontology generation/editing, and knowledge graph creation/visualisation | 8501 |
+| **Dialog with Data Agent** | Accepts a natural language query, traverses the knowledge graph for schema context, plans and executes multiple SQL queries, stitches results, and derives LLM insights | 8003 |
+| **Streamlit UI** | Web interface for extractions, history, search, ontology generation/editing, knowledge graph creation/visualisation, and natural-language dialog | 8501 |
 
-All three agents are **completely decoupled**: each has zero imports from the others. They communicate only through JSON contracts passed via the UI.
+All four agents are **completely decoupled**: each has zero imports from the others. They communicate only through JSON contracts passed via the UI.
 
 ---
 
@@ -55,17 +57,22 @@ All three agents are **completely decoupled**: each has zero imports from the ot
 │  │              │  HTTP   └──────────────────┘                          │
 │  │              │ ──────► ┌──────────────────┐                          │
 │  │              │         │  kg-api          │  port 8002               │
+│  │              │         │  (FastAPI)        │                          │
+│  │              │         │  kg_api.py        │                          │
+│  │              │  HTTP   └──────────────────┘                          │
+│  │              │ ──────► ┌──────────────────┐                          │
+│  │              │         │  dialog-api      │  port 8003               │
 │  └──────────────┘         │  (FastAPI)        │                          │
-│                           │  kg_api.py        │                          │
+│                           │  dialog_api.py    │                          │
 │                           └──────────────────┘                          │
 └──────────────────────────────────────────────────────────────────────────┘
-         │                                              │
-         ▼                                              ▼
-┌─────────────────────┐                  ┌──────────────────────────┐
-│  Source Database     │                  │  Target Graph Database   │
-│  PostgreSQL / Oracle │                  │  Neo4j (bolt://)  or     │
-│  SQL Server /        │                  │  Gremlin Server (ws://)  │
-│  Teradata / Redshift │                  └──────────────────────────┘
+         │                          │                    │
+         ▼                          ▼                    ▼
+┌─────────────────────┐  ┌─────────────────────┐  ┌──────────────────────────┐
+│  Source Database     │  │  Source Database     │  │  Target Graph Database   │
+│  PostgreSQL / Oracle │  │  (Dialog SQL target) │  │  Neo4j (bolt://)  or     │
+│  SQL Server /        │  │  any supported DB    │  │  Gremlin Server (ws://)  │
+│  Teradata / Redshift │  └─────────────────────┘  └──────────────────────────┘
 │  BigQuery / Delta    │
 └─────────────────────┘
 ```
@@ -74,7 +81,8 @@ All three agents are **completely decoupled**: each has zero imports from the ot
 
 - The UI is the orchestrator for all cross-service workflows. It fetches results from one service and sends them to the next. The backend services never talk to each other.
 - For knowledge graph creation: the UI fetches the ontology text from `ontology-api` and sends it to `kg-api`. The `kg-api` connects directly to the user's Neo4j or Gremlin server.
-- Reports and ontology files are written to a named Docker volume (`reports_data`) mounted by both `agent-api` and `ontology-api`. The `kg-api` does not need the volume — it operates entirely in-memory.
+- For dialog with data: the UI fetches graph data from `kg-api` and sends it along with the NQL and DB credentials to `dialog-api`. The `dialog-api` connects directly to the user's target database for SQL execution.
+- Reports and ontology files are written to a named Docker volume (`reports_data`) mounted by both `agent-api` and `ontology-api`. The `kg-api` and `dialog-api` do not need the volume — they operate entirely in-memory.
 - All inter-service communication uses Docker's internal DNS (service names, not `localhost`).
 - All API services expose a `/health` endpoint and use FastAPI `BackgroundTasks` for non-blocking job execution.
 
@@ -647,6 +655,156 @@ Node size scales with the number of datatype properties (more columns → larger
 
 ---
 
+## Dialog with Data Agent
+
+### Package Structure
+
+```
+dialog_agent/
+├── __init__.py               # Exports: DialogAgent, DialogConfig
+├── config.py                 # DialogConfig dataclass
+├── state.py                  # DialogState TypedDict, SQLQuery, QueryResult
+├── agent.py                  # LangGraph graph definition + DialogAgent class
+└── nodes/
+    ├── __init__.py
+    ├── understand_node.py    # Build schema context from KG nodes/edges
+    ├── plan_node.py          # LLM decomposes NQL into SQL queries
+    ├── execute_node.py       # Execute SQL queries against target database
+    └── synthesize_node.py    # LLM stitches results into narrative insights
+```
+
+This package has **zero imports** from `metadata_agent`, `ontology_agent`, or `knowledge_graph_agent`. Its inputs are:
+1. A natural language query string
+2. KG graph data (nodes + edges from the KG Agent) — optional
+3. DB connection credentials for SQL execution
+
+### Configuration
+
+```python
+# dialog_agent/config.py
+
+@dataclass
+class DialogConfig:
+    # Target database for SQL execution
+    db_type: str = "postgres"       # "postgres"|"oracle"|"sqlserver"|"bigquery"|etc.
+    db_host: str = ""
+    db_port: int = 5432
+    db_name: str = ""
+    db_schema: str = "public"
+    db_user: str = ""
+    db_password: str = ""
+    db_connection_string: str = "" # overrides individual fields when set
+    db_extra: Dict[str, Any] = {}
+
+    # LLM settings
+    llm_model: str = "claude-sonnet-4-6"
+    llm_temperature: float = 0.0
+
+    # Query behaviour
+    max_sql_queries: int = 10       # max SQL queries the planner may emit
+    row_limit: int = 500            # LIMIT applied to each query
+    max_insight_rows: int = 2000    # rows passed to the synthesizer LLM
+```
+
+### State
+
+```python
+# dialog_agent/state.py
+
+class SQLQuery(TypedDict):
+    query_id: str
+    description: str
+    sql: str
+    table_refs: List[str]
+
+class QueryResult(TypedDict):
+    query_id: str
+    description: str
+    sql: str
+    columns: List[str]
+    rows: List[List[Any]]
+    row_count: int
+    error: Optional[str]
+
+class DialogState(TypedDict, total=False):
+    config: Any                # DialogConfig
+    natural_query: str         # the user's NQL string
+    schema_context: str        # graph/ontology summary fed to LLM
+    kg_nodes: List[Dict]       # knowledge graph nodes
+    kg_edges: List[Dict]       # knowledge graph edges
+    sql_queries: List[SQLQuery]     # planner output
+    query_results: List[QueryResult]# executor output
+    insights: str              # LLM-derived narrative
+    errors: List[str]
+    phase: str
+```
+
+### LangGraph Pipeline
+
+```
+START
+  │
+  ▼
+understand_node    Converts KG nodes/edges into a structured schema description
+  │                (table names, columns, relationships). No LLM call.
+  │                Sets: schema_context
+  │
+  ▼
+plan_node          Calls Claude with the NQL + schema_context.
+  │                LLM returns a JSON array of {query_id, description, sql, table_refs}.
+  │                Sets: sql_queries
+  │
+  ▼
+execute_node       Connects to target DB using the appropriate driver.
+  │                Executes each SQL query, captures columns + rows + errors.
+  │                Sets: query_results
+  │
+  ▼
+synthesize_node    Renders each result as a markdown table (max 20 rows each).
+  │                Calls Claude to derive narrative insights from all results.
+  │                Sets: insights
+  │
+  ▼
+END
+```
+
+### Node Details
+
+**understand_node** (`nodes/understand_node.py`)
+- Parses KG node `title` tooltips to extract column/property lists
+- Parses KG edges to extract inter-table relationships
+- Produces a structured text schema context like:
+  ```
+  Table / Class: orders  (id=...#orders)
+    Properties:
+      - order_id: integer
+      - order_date: dateTime
+    [RELATION] fk_customers -> customers (1:N, coverage=0.998)
+  ```
+- Falls back to `"(No schema context available)"` if KG data is empty (schema-less mode)
+
+**plan_node** (`nodes/plan_node.py`)
+- System prompt enforces: return only JSON, use only known tables/columns, apply LIMIT
+- Uses `re.sub` to strip markdown code fences from LLM output before JSON parsing
+- Caps output at `config.max_sql_queries`
+- Errors are caught and stored in `state["errors"]`; empty list returned (pipeline continues)
+
+**execute_node** (`nodes/execute_node.py`)
+- Supports: PostgreSQL/Redshift (psycopg2), Oracle (cx_Oracle), SQL Server (pyodbc), BigQuery (google-cloud-bigquery)
+- Per-query error capture — a failed query does not abort the pipeline
+- Respects `config.row_limit` for each result set
+
+**synthesize_node** (`nodes/synthesize_node.py`)
+- Renders each `QueryResult` as a markdown table (max 20 preview rows)
+- Truncates the combined results text to `config.max_insight_rows * 4` chars to stay within LLM context
+- Produces a structured markdown narrative with key findings, patterns, and recommendations
+
+### Schema-less Mode
+
+If no KG job is selected in the UI, `kg_nodes` and `kg_edges` are empty. The `understand_node` sets `schema_context = "(No schema context available)"`. The `plan_node` LLM must then rely solely on the natural language query and DB type to generate SQL — it may ask for table names or produce generic queries. This mode is useful for ad-hoc exploration where the user knows the schema.
+
+---
+
 ## API Services
 
 ### Metadata Extraction API (`api.py`, port 8000)
@@ -744,6 +902,55 @@ The `_jobs` dict stores per-job: status, completed_nodes, current_node, node_cou
 
 ---
 
+### Dialog with Data API (`dialog_api.py`, port 8003)
+
+Completely standalone FastAPI service. Accepts a natural language query + KG graph data + DB credentials, runs the dialog pipeline, and returns SQL queries, tabular results, and LLM insights.
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/query` | Start async dialog job → `{"job_id": "..."}` (HTTP 202) |
+| `GET` | `/jobs/{job_id}` | Poll status — returns query_count, result_count |
+| `GET` | `/jobs/{job_id}/results` | Fetch full results: insights, sql_queries, query_results |
+| `GET` | `/list` | List all dialog jobs |
+
+**Query request body:**
+```json
+{
+  "natural_query": "Which customers placed more than 5 orders in the last 90 days?",
+  "kg_nodes": [{ "id": "...", "label": "orders", "title": "...", "size": 25 }],
+  "kg_edges": [{ "from": "...", "to": "...", "label": "fk_customers", "title": "..." }],
+  "db_type": "postgres",
+  "db_host": "localhost",
+  "db_port": 5432,
+  "db_name": "mydb",
+  "db_schema": "public",
+  "db_user": "admin",
+  "db_password": "secret",
+  "max_sql_queries": 5,
+  "row_limit": 500
+}
+```
+
+**Results response:**
+```json
+{
+  "natural_query": "Which customers placed more than 5 orders...",
+  "insights": "## Key Findings\n\n- **147 customers** placed more than 5 orders...",
+  "sql_queries": [
+    { "query_id": "q1", "description": "Count orders per customer", "sql": "SELECT ...", "table_refs": ["orders"] }
+  ],
+  "query_results": [
+    { "query_id": "q1", "description": "...", "sql": "...", "columns": ["customer_id", "order_count"], "rows": [[42, 12], ...], "row_count": 147, "error": null }
+  ],
+  "errors": []
+}
+```
+
+---
+
 ### Ontology API (`ontology_api.py`, port 8001)
 
 Completely standalone FastAPI service. Accepts a metadata report JSON, runs the ontology pipeline, and returns an OWL/RDF file.
@@ -785,7 +992,7 @@ The background task (`_run_ontology`) uses `agent.stream_run()` to yield `(node_
 
 ### File: `app.py`
 
-The UI is organized into four navigation views, reachable from the sidebar.
+The UI is organized into six navigation views, reachable from the sidebar.
 
 ### API Clients
 
@@ -816,12 +1023,13 @@ onto_api = OntologyAPIClient(ONTOLOGY_API_URL)  # for ontology generation and ma
 ### API Clients
 
 ```python
-api      = APIClient(AGENT_API_URL)          # extraction, history, search, Q&A
-onto_api = OntologyAPIClient(ONTOLOGY_API_URL)  # ontology generation and management
-kg_api   = KGAPIClient(KG_API_URL)           # knowledge graph creation and visualisation
+api        = APIClient(AGENT_API_URL)            # extraction, history, search, Q&A
+onto_api   = OntologyAPIClient(ONTOLOGY_API_URL) # ontology generation and management
+kg_api     = KGAPIClient(KG_API_URL)             # knowledge graph creation and visualisation
+dialog_api = DialogAPIClient(DIALOG_API_URL)     # dialog with data (NQL → SQL → insights)
 ```
 
-All three clients extract FastAPI `detail` fields from error responses for meaningful error messages.
+All four clients extract FastAPI `detail` fields from error responses for meaningful error messages.
 
 **`KGAPIClient` methods:**
 
@@ -832,6 +1040,16 @@ All three clients extract FastAPI `detail` fields from error responses for meani
 | `get_job(job_id)` | `GET /jobs/{id}` | status dict |
 | `get_graph(job_id)` | `GET /jobs/{id}/graph` | `{nodes, edges}` |
 | `get_queries(job_id)` | `GET /jobs/{id}/queries` | `{graph_type, queries, count}` |
+| `list_jobs()` | `GET /list` | `List[Dict]` |
+
+**`DialogAPIClient` methods:**
+
+| Method | HTTP call | Returns |
+|---|---|---|
+| `health()` | `GET /health` | `bool` |
+| `query(payload)` | `POST /query` | `job_id: str` |
+| `get_job(job_id)` | `GET /jobs/{id}` | status dict |
+| `get_results(job_id)` | `GET /jobs/{id}/results` | full results dict |
 | `list_jobs()` | `GET /list` | `List[Dict]` |
 
 ### Views
@@ -904,11 +1122,30 @@ Uses `pyvis.network.Network` to build an in-memory interactive network graph:
   - "Download File" button: calls `onto_api.get_bytes(job_id)` and triggers browser download via `st.download_button`.
 - Previously generated ontologies section: lists all jobs from `onto_api.list_jobs()` with View/Download actions.
 
+**6. Dialog with Data — `_dialog_view()`**
+
+- Health check: if `dialog_api.health()` returns `False`, shows error banner.
+- Natural language input: multi-line text area for the user's question.
+- KG context selector: dropdown of completed KG jobs from `kg_api.list_jobs()`. Selecting one provides schema context. "(no KG — schema-less mode)" skips KG context.
+- Database connection form: type selector + host/port/database/schema/credentials (same as Extract view).
+- Query controls: max SQL queries (1–20), row limit per query (10–5000).
+- On "Ask the Data":
+  1. Fetches KG graph data via `kg_api.get_graph(selected_kg_id)` if a KG was selected.
+  2. POSTs to `dialog_api.query({natural_query, kg_nodes, kg_edges, db_*, max_sql_queries, row_limit})`.
+  3. Polls `dialog_api.get_job(job_id)` with a 4-node progress tracker (understand → plan → execute → synthesize).
+- On completion:
+  - Stat cards: Queries Planned, Queries Executed, Succeeded, Failed.
+  - Insights narrative: LLM-generated markdown rendered in a styled container.
+  - Query results: each SQL query result in a collapsible expander with the SQL, row count, and a `st.dataframe` table.
+  - Generated SQL queries: collapsed expander showing all planned SQL statements.
+  - Previous dialogs: load past sessions with "Load" buttons.
+- `_render_query_results(results)`: renders each `QueryResult` as a labeled expander. Uses `pandas.DataFrame` for the tabular view.
+
 ---
 
 ## Docker Setup
 
-### Three Dockerfiles
+### Four Dockerfiles
 
 **`Dockerfile.kg`** — Knowledge Graph API
 
@@ -927,6 +1164,23 @@ Stage 2 (runtime):
   - Exposes port 8002
   - Healthcheck: urllib.request to /health
   - CMD: uvicorn kg_api:app --host 0.0.0.0 --port 8002
+```
+
+**`Dockerfile.dialog`** — Dialog with Data API
+
+```
+Stage 1 (builder):
+  - python:3.11-slim
+  - pip install -r requirements.dialog.txt into /install
+
+Stage 2 (runtime):
+  - python:3.11-slim
+  - Copies /install from builder
+  - Copies dialog_agent/ package only
+  - Copies dialog_api.py (FastAPI entry point)
+  - No shared volume — Dialog agent is stateless (in-memory job store)
+  - Exposes port 8003
+  - CMD: uvicorn dialog_api:app --host 0.0.0.0 --port 8003
 ```
 
 **`Dockerfile.agent`** — Metadata Extraction API
@@ -1025,6 +1279,19 @@ services:
     networks: [metadata-net]
     # No volume — KGAgent is stateless; it connects directly to user's Neo4j/Gremlin server
 
+  dialog-api:
+    build: { dockerfile: Dockerfile.dialog }
+    image: metadata-dialog-api:latest
+    ports: ["${DIALOG_PORT:-8003}:8003"]
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: [python -c "urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 15s  timeout: 5s  retries: 5  start_period: 15s
+    networks: [metadata-net]
+    # No volume — DialogAgent connects directly to user's target DB at query time
+
   ui:
     build: { dockerfile: Dockerfile.ui }
     image: metadata-agent-ui:latest
@@ -1032,9 +1299,13 @@ services:
     environment:
       AGENT_API_URL:    "http://agent-api:8000"
       ONTOLOGY_API_URL: "http://ontology-api:8001"
+      KG_API_URL:       "http://kg-api:8002"
+      DIALOG_API_URL:   "http://dialog-api:8003"
     depends_on:
       agent-api:    { condition: service_healthy }
-      ontology-api: { condition: service_healthy }
+      ontology-api: { condition: service_started }
+      kg-api:       { condition: service_started }
+      dialog-api:   { condition: service_started }
     networks: [metadata-net]
 
 volumes:

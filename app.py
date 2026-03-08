@@ -97,6 +97,9 @@ ONTOLOGY_API_URL = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001").r
 # ── Knowledge Graph API client (separate microservice) ─────────────────────────
 KG_API_URL = os.environ.get("KG_API_URL", "http://localhost:8002").rstrip("/")
 
+# ── Dialog with Data API client (separate microservice) ────────────────────────
+DIALOG_API_URL = os.environ.get("DIALOG_API_URL", "http://localhost:8003").rstrip("/")
+
 
 class OntologyAPIClient:
     def __init__(self, base: str):
@@ -189,6 +192,46 @@ class KGAPIClient:
 
 
 kg_api = KGAPIClient(KG_API_URL)
+
+
+# ── Dialog with Data API client ────────────────────────────────────────────────
+class DialogAPIClient:
+    def __init__(self, base: str):
+        self._base = base
+
+    def _check(self, r: "requests.Response") -> "requests.Response":
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
+        return r
+
+    def health(self) -> bool:
+        try:
+            return requests.get(f"{self._base}/health", timeout=5).status_code == 200
+        except Exception:
+            return False
+
+    def query(self, payload: Dict) -> str:
+        r = self._check(requests.post(f"{self._base}/query", json=payload, timeout=120))
+        return r.json()["job_id"]
+
+    def get_job(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}", timeout=30)).json()
+
+    def get_results(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}/results", timeout=30)).json()
+
+    def list_jobs(self) -> List[Dict]:
+        try:
+            return requests.get(f"{self._base}/list", timeout=10).json()
+        except Exception:
+            return []
+
+
+dialog_api = DialogAPIClient(DIALOG_API_URL)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_META: Dict[str, Dict] = {
@@ -408,7 +451,9 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("running_job_id", None),
                 ("onto_job_id", None), ("onto_result", None),
                 ("onto_content", None), ("onto_last_job_id", None),
-                ("kg_job_id", None), ("kg_result", None), ("kg_graph_data", None)]:
+                ("kg_job_id", None), ("kg_result", None), ("kg_graph_data", None),
+                ("dialog_job_id", None), ("dialog_result", None),
+                ("dialog_kg_job_id", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -423,7 +468,7 @@ def _sidebar() -> None:
         )
         # API status indicators
         for label, checker in [("Agent API", api.health), ("Ontology API", onto_api.health),
-                                ("KG API", kg_api.health)]:
+                                ("KG API", kg_api.health), ("Dialog API", dialog_api.health)]:
             ok  = checker()
             dot = "🟢" if ok else "🔴"
             st.markdown(
@@ -437,7 +482,8 @@ def _sidebar() -> None:
                                    ("history",  "🗂️",  "History"),
                                    ("search",   "🔍", "Search Metadata"),
                                    ("ontology", "🦉", "Ontology Generator"),
-                                   ("kg",       "🕸️", "Knowledge Graph")]:
+                                   ("kg",       "🕸️", "Knowledge Graph"),
+                                   ("dialog",   "💬", "Dialog with Data")]:
             active = st.session_state.page == key
             if st.button(
                 f"{icon}  {label}",
@@ -1545,6 +1591,365 @@ def _kg_view() -> None:
                 st.markdown(f"- {err}")
 
 
+# ── Dialog with Data view ──────────────────────────────────────────────────────
+_DIALOG_NODES = [
+    ("understand", "🔎", "Analysing schema context"),
+    ("plan",       "📝", "Planning SQL queries"),
+    ("execute",    "⚡", "Executing queries"),
+    ("synthesize", "💡", "Synthesising insights"),
+]
+
+
+def _dialog_node_html(nodes_state: Dict[str, str]) -> str:
+    icons  = {n[0]: n[1] for n in _DIALOG_NODES}
+    labels = {n[0]: n[2] for n in _DIALOG_NODES}
+    items  = []
+    for name, _, _ in _DIALOG_NODES:
+        s      = nodes_state.get(name, "pending")
+        prefix = {"running": "⟳ ", "done": "✓ ", "error": "✗ "}.get(s, "○ ")
+        items.append(
+            f'<div class="node-item node-{s}">'
+            f'{icons[name]} {prefix}{labels[name]}</div>'
+        )
+    return "<div>" + "".join(items) + "</div>"
+
+
+def _render_query_results(results: List[Dict]) -> None:
+    """Render each SQL query result as an expandable table."""
+    import json as _json
+    for qr in results:
+        qid   = qr.get("query_id", "")
+        desc  = qr.get("description", "")
+        sql   = qr.get("sql", "")
+        cols  = qr.get("columns") or []
+        rows  = qr.get("rows") or []
+        err   = qr.get("error")
+        count = qr.get("row_count", len(rows))
+
+        header = f"{qid}: {desc}" if desc else qid
+        with st.expander(header, expanded=False):
+            st.code(sql, language="sql")
+            if err:
+                st.markdown(
+                    f'<div class="banner-err">⚠ Query error: {err}</div>',
+                    unsafe_allow_html=True,
+                )
+            elif cols:
+                st.caption(f"{count} row(s) returned" + (" (showing first 500)" if count > 500 else ""))
+                import pandas as pd
+                df = pd.DataFrame(rows, columns=cols)
+                st.dataframe(df, use_container_width=True, height=min(300, 40 + len(df) * 35))
+            else:
+                st.info("No data returned.")
+
+
+def _dialog_view() -> None:
+    st.markdown(
+        '<div class="hero"><div class="hero-title">Dialog with Data</div>'
+        '<div class="hero-sub">Ask natural language questions about your data. '
+        'The agent traverses the knowledge graph, plans SQL queries, executes them, '
+        'and derives insights — all in one pipeline.</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not dialog_api.health():
+        st.markdown(
+            f'<div class="banner-err">⚠ Dialog API is unreachable at {DIALOG_API_URL}. '
+            f'Make sure the dialog-api container is running.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Config panel ──────────────────────────────────────────────────────────
+    col_cfg, col_prog = st.columns([3, 2], gap="large")
+
+    with col_cfg:
+        st.markdown('<div class="sec-head">💬 Your Question</div>', unsafe_allow_html=True)
+
+        natural_query = st.text_area(
+            "Natural language query",
+            placeholder="Which customers placed more than 5 orders in the last 90 days? "
+                        "What is the total revenue by product category?",
+            height=100,
+            label_visibility="collapsed",
+        )
+
+        st.markdown('<div class="sec-head" style="margin-top:1rem">🕸️ Schema Context (Knowledge Graph)</div>',
+                    unsafe_allow_html=True)
+        st.caption("Select a completed KG job so the agent understands your schema.")
+
+        kg_jobs = [j for j in kg_api.list_jobs() if j.get("status") == "done"]
+        kg_options: Dict[str, Optional[str]] = {"(no KG — schema-less mode)": None}
+        for j in kg_jobs:
+            label = (f'{j.get("graph_type","?").upper()} · '
+                     f'{j.get("node_count",0)} nodes · '
+                     f'{j.get("edge_count",0)} edges · '
+                     f'id={j["id"][:8]}')
+            kg_options[label] = j["id"]
+
+        selected_kg_label = st.selectbox("Knowledge graph", list(kg_options.keys()))
+        selected_kg_id    = kg_options[selected_kg_label]
+
+        st.markdown('<div class="sec-head" style="margin-top:1rem">🔌 Target Database</div>',
+                    unsafe_allow_html=True)
+
+        db_type = st.selectbox(
+            "Database type",
+            options=list(DB_META.keys()),
+            format_func=lambda k: f'{DB_META[k]["icon"]}  {DB_META[k]["label"]}',
+            key="dialog_db_type",
+        )
+
+        needs_bq = db_type == "bigquery"
+
+        if needs_bq:
+            c1, c2 = st.columns(2)
+            d_project = c1.text_input("GCP Project", key="d_project")
+            d_schema  = c2.text_input("Dataset", key="d_schema")
+            d_creds   = st.text_input("Service account JSON path", key="d_creds")
+            d_host = d_port = d_dbname = d_user = d_password = d_schema_name = ""
+        else:
+            c1, c2 = st.columns([3, 1])
+            d_host = c1.text_input("Host", placeholder="localhost", key="d_host")
+            defaults = {"postgres": 5432, "oracle": 1521, "sqlserver": 1433,
+                        "teradata": 1025, "redshift": 5439}
+            d_port = c2.number_input("Port", value=defaults.get(db_type, 5432),
+                                     step=1, key="d_port")
+            c3, c4 = st.columns(2)
+            d_dbname     = c3.text_input("Database", key="d_dbname")
+            d_schema_name = c4.text_input("Schema", value="public", key="d_schema_name")
+            c5, c6 = st.columns(2)
+            d_user     = c5.text_input("Username", key="d_user")
+            d_password = c6.text_input("Password", type="password", key="d_password")
+            d_project = d_schema = d_creds = ""
+
+        c_q, c_r = st.columns(2)
+        max_sql = c_q.number_input("Max SQL queries", min_value=1, max_value=20,
+                                    value=5, key="d_max_sql")
+        row_lim = c_r.number_input("Row limit per query", min_value=10, max_value=5000,
+                                    value=500, key="d_row_limit")
+
+        ask_btn = st.button(
+            "💬  Ask the Data", type="primary", use_container_width=True,
+            disabled=bool(st.session_state.dialog_job_id),
+        )
+
+    # ── Progress panel ────────────────────────────────────────────────────────
+    with col_prog:
+        st.markdown('<div class="sec-head">📡 Pipeline Progress</div>', unsafe_allow_html=True)
+        prog_area  = st.empty()
+        error_area = st.empty()
+
+        job_id = st.session_state.dialog_job_id
+        if job_id:
+            try:
+                status = dialog_api.get_job(job_id)
+            except Exception as e:
+                error_area.markdown(
+                    f'<div class="banner-err">⚠ API error: {e}</div>', unsafe_allow_html=True)
+                st.session_state.dialog_job_id = None
+                status = None
+
+            if status:
+                completed = set(status.get("completed_nodes") or [])
+                current   = status.get("current_node") or ""
+                ns_map    = {
+                    name: ("done"    if name in completed else
+                           "running" if name == current and status["status"] == "running" else
+                           "pending")
+                    for name, _, _ in _DIALOG_NODES
+                }
+                prog_area.markdown(_dialog_node_html(ns_map), unsafe_allow_html=True)
+
+                if status["status"] == "done":
+                    try:
+                        full = dialog_api.get_results(job_id)
+                    except Exception:
+                        full = {}
+                    st.session_state.dialog_result = {**status, **full}
+                    st.session_state.dialog_job_id  = None
+                    st.balloons()
+                    st.rerun()
+                elif status["status"] == "error":
+                    for k in ns_map:
+                        if ns_map[k] == "running":
+                            ns_map[k] = "error"
+                    prog_area.markdown(_dialog_node_html(ns_map), unsafe_allow_html=True)
+                    error_area.markdown(
+                        f'<div class="banner-err">⚠ Pipeline failed: '
+                        f'{status.get("error","unknown error")}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.session_state.dialog_job_id = None
+                else:
+                    time.sleep(1.5)
+                    st.rerun()
+        else:
+            prog_area.markdown(
+                _dialog_node_html({n[0]: "pending" for n in _DIALOG_NODES}),
+                unsafe_allow_html=True,
+            )
+
+    # ── Trigger ───────────────────────────────────────────────────────────────
+    if ask_btn:
+        if not natural_query.strip():
+            st.error("Please enter a question.")
+            return
+
+        # Fetch KG graph data if a KG job was selected
+        kg_nodes: List[Dict] = []
+        kg_edges: List[Dict] = []
+        if selected_kg_id:
+            try:
+                gd = kg_api.get_graph(selected_kg_id)
+                kg_nodes = gd.get("nodes", [])
+                kg_edges = gd.get("edges", [])
+            except Exception as e:
+                st.warning(f"Could not load KG graph data: {e}. Proceeding in schema-less mode.")
+
+        if needs_bq:
+            db_extra: Dict = {}
+            if d_creds:
+                db_extra["credentials_path"] = d_creds
+            payload: Dict[str, Any] = {
+                "natural_query": natural_query.strip(),
+                "kg_nodes":      kg_nodes,
+                "kg_edges":      kg_edges,
+                "db_type":       db_type,
+                "db_name":       d_project,
+                "db_schema":     d_schema,
+                "db_extra":      db_extra,
+                "max_sql_queries": int(max_sql),
+                "row_limit":     int(row_lim),
+            }
+        else:
+            payload = {
+                "natural_query": natural_query.strip(),
+                "kg_nodes":      kg_nodes,
+                "kg_edges":      kg_edges,
+                "db_type":       db_type,
+                "db_host":       d_host,
+                "db_port":       int(d_port),
+                "db_name":       d_dbname,
+                "db_schema":     d_schema_name or "public",
+                "db_user":       d_user,
+                "db_password":   d_password,
+                "max_sql_queries": int(max_sql),
+                "row_limit":     int(row_lim),
+            }
+
+        try:
+            jid = dialog_api.query(payload)
+            st.session_state.dialog_job_id = jid
+            st.session_state.dialog_result  = None
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to start dialog job: {e}")
+        return
+
+    # ── Results panel ─────────────────────────────────────────────────────────
+    result = st.session_state.dialog_result
+
+    if not result or st.session_state.dialog_job_id:
+        # Show list of previous dialog sessions
+        done_list = [j for j in dialog_api.list_jobs() if j.get("status") == "done"]
+        if done_list:
+            st.markdown(
+                "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div class="sec-head">📚 Previous Dialogs</div>', unsafe_allow_html=True)
+            for j in done_list:
+                cols = st.columns([7, 2])
+                with cols[0]:
+                    st.markdown(
+                        f'<div class="hcard">'
+                        f'<div class="hcard-title">💬 {j.get("natural_query","?")[:80]}</div>'
+                        f'<div class="hcard-meta">'
+                        f'{j.get("db_type","?").upper()} &nbsp;·&nbsp; '
+                        f'{j.get("query_count",0)} queries &nbsp;·&nbsp; '
+                        f'{j.get("result_count",0)} results</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🔎 Load", key=f"dialog_load_{j['id']}"):
+                        try:
+                            full = dialog_api.get_results(j["id"])
+                            st.session_state.dialog_result = {**j, **full}
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not load: {e}")
+        return
+
+    # ── Insights ──────────────────────────────────────────────────────────────
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    q_count = result.get("query_count", len(result.get("sql_queries") or []))
+    r_count = result.get("result_count", len(result.get("query_results") or []))
+    st.markdown(
+        f'<div class="banner-ok" style="margin-bottom:1rem">'
+        f'✓ Analysis complete — {q_count} queries planned, {r_count} executed</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="stat-row">'
+        + _stat_card(q_count, "Queries Planned", "#63b3ed")
+        + _stat_card(r_count, "Queries Executed", "#68d391")
+        + _stat_card(
+            len([x for x in (result.get("query_results") or []) if not x.get("error")]),
+            "Succeeded", "#b794f4",
+        )
+        + _stat_card(
+            len([x for x in (result.get("query_results") or []) if x.get("error")]),
+            "Failed", "#fc814a",
+        )
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Insights narrative
+    insights = result.get("insights", "")
+    if insights:
+        st.markdown('<div class="sec-head" style="margin-top:1.5rem">💡 Insights</div>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="background:rgba(183,148,244,0.08);border:1px solid rgba(183,148,244,0.2);'
+            f'border-radius:12px;padding:1.2rem 1.5rem;color:#e2e8f0;font-size:0.9rem">'
+            f'{insights}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Query results breakdown
+    query_results = result.get("query_results") or []
+    if query_results:
+        st.markdown('<div class="sec-head" style="margin-top:1.5rem">📊 Query Results</div>',
+                    unsafe_allow_html=True)
+        _render_query_results(query_results)
+
+    # SQL queries (collapsed)
+    sql_queries = result.get("sql_queries") or []
+    if sql_queries:
+        with st.expander(f"📋 Generated SQL queries ({len(sql_queries)})", expanded=False):
+            for q in sql_queries:
+                st.markdown(
+                    f'<div style="color:#63b3ed;font-size:0.82rem;margin-bottom:0.2rem;'
+                    f'font-weight:600">{q.get("query_id","")}: {q.get("description","")}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(q.get("sql", ""), language="sql")
+
+    # Errors (collapsed)
+    errors = result.get("errors") or []
+    if errors:
+        with st.expander(f"⚠ {len(errors)} warning(s)"):
+            for err in errors:
+                st.markdown(f"- {err}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     _inject_css()
@@ -1560,6 +1965,8 @@ def main() -> None:
         _ontology_view()
     elif page == "kg":
         _kg_view()
+    elif page == "dialog":
+        _dialog_view()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,25 @@
+# ── Stage 1: builder ─────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+COPY requirements.dialog.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.dialog.txt
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy installed packages
+COPY --from=builder /install /usr/local
+
+# Copy only the dialog agent package and its API entry-point
+COPY dialog_agent/ ./dialog_agent/
+COPY dialog_api.py .
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8003
+
+CMD ["uvicorn", "dialog_api:app", "--host", "0.0.0.0", "--port", "8003", "--log-level", "info"]

@@ -107,14 +107,14 @@ def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     # Sort longest first to avoid partial replacements (e.g. "order" before "orders")
     for table in sorted(known_tables, key=len, reverse=True):
         qualified = f"{db_schema}.{table}"
-        # Skip if already present in the SQL
-        if re.search(r'(?i)' + re.escape(qualified), sql):
+        # Skip if already present in the SQL (case-insensitive)
+        if re.search(re.escape(qualified), sql, re.IGNORECASE):
             continue
         # Replace bare table name not preceded by a dot
         # Negative lookbehind for `.` or alphanumeric ensures we don't touch substrings
-        pattern = r'(?<![.\w])(?i)\b' + re.escape(table) + r'\b(?!\s*\.)'
-        if re.search(pattern, sql):
-            sql = re.sub(pattern, qualified, sql)
+        pattern = r'(?<![.\w])\b' + re.escape(table) + r'\b(?!\s*\.)'
+        if re.search(pattern, sql, re.IGNORECASE):
+            sql = re.sub(pattern, qualified, sql, flags=re.IGNORECASE)
 
     return sql
 

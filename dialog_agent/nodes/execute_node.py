@@ -63,6 +63,11 @@ def _run_postgres(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     conn.autocommit = True
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Set search_path so unqualified table names resolve to the right schema.
+            # This is a defence-in-depth measure: the LLM should already qualify names,
+            # but this ensures the query works even if it doesn't.
+            if cfg.db_schema:
+                cur.execute(f"SET search_path TO {cfg.db_schema}, public")
             cur.execute(sql)
             columns = [desc[0] for desc in (cur.description or [])]
             rows    = [[row[c] for c in columns] for row in (cur.fetchall() or [])]
@@ -82,6 +87,9 @@ def _run_oracle(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         conn = cx_Oracle.connect(cfg.db_user, cfg.db_password, dsn)
     try:
         with conn.cursor() as cur:
+            # Set current schema so unqualified names resolve correctly
+            if cfg.db_schema:
+                cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {cfg.db_schema}")
             cur.execute(sql)
             return _cursor_to_result(cur)
     finally:
@@ -101,6 +109,10 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         )
     try:
         with conn.cursor() as cur:
+            # Switch to the target schema so unqualified names resolve correctly
+            if cfg.db_schema:
+                cur.execute(f"USE [{cfg.db_name}]")
+                cur.execute(f"SET SCHEMA [{cfg.db_schema}]")
             cur.execute(sql)
             return _cursor_to_result(cur)
     finally:

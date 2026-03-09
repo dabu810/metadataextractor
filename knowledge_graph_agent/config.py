@@ -22,5 +22,6 @@ class KGConfig:
     gremlin_traversal_source:  str = "g"
 
     # ── Behaviour ─────────────────────────────────────────────────────────────
+    mode:           str  = "generate"  # "generate" | "update" | "load"
     clear_existing: bool = False       # Drop all existing vertices/edges before loading
     batch_size:     int  = 50          # Queries executed per batch (for progress tracking)

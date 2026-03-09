@@ -184,6 +184,10 @@ class KGAPIClient:
     def get_queries(self, job_id: str) -> Dict:
         return self._check(requests.get(f"{self._base}/jobs/{job_id}/queries", timeout=30)).json()
 
+    def fetch(self, payload: Dict) -> str:
+        r = self._check(requests.post(f"{self._base}/fetch", json=payload, timeout=120))
+        return r.json()["job_id"]
+
     def list_jobs(self) -> List[Dict]:
         try:
             return requests.get(f"{self._base}/list", timeout=10).json()
@@ -229,6 +233,22 @@ class DialogAPIClient:
             return requests.get(f"{self._base}/list", timeout=10).json()
         except Exception:
             return []
+
+    def list_cache(self) -> List[Dict]:
+        try:
+            return requests.get(f"{self._base}/cache", timeout=10).json()
+        except Exception:
+            return []
+
+    def delete_cache_entry(self, cache_key: str) -> None:
+        requests.delete(f"{self._base}/cache/{cache_key}", timeout=10)
+
+    def clear_cache(self) -> int:
+        try:
+            r = requests.delete(f"{self._base}/cache", timeout=10)
+            return r.json().get("deleted_count", 0)
+        except Exception:
+            return 0
 
 
 dialog_api = DialogAPIClient(DIALOG_API_URL)
@@ -452,6 +472,7 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("onto_job_id", None), ("onto_result", None),
                 ("onto_content", None), ("onto_last_job_id", None),
                 ("kg_job_id", None), ("kg_result", None), ("kg_graph_data", None),
+                ("kg_mode", "generate"),
                 ("dialog_job_id", None), ("dialog_result", None),
                 ("dialog_kg_job_id", None)]:
     if _k not in st.session_state:
@@ -1252,13 +1273,17 @@ _KG_NODES = [
     ("translate", "🔄", "Translating to Cypher/Gremlin"),
     ("execute",   "⚡", "Executing on graph database"),
 ]
+_KG_LOAD_NODES = [
+    ("fetch", "📥", "Loading graph from database"),
+]
 
 
-def _kg_node_html(nodes_state: Dict[str, str]) -> str:
-    icons  = {n[0]: n[1] for n in _KG_NODES}
-    labels = {n[0]: n[2] for n in _KG_NODES}
+def _kg_node_html(nodes_state: Dict[str, str], load_mode: bool = False) -> str:
+    node_list = _KG_LOAD_NODES if load_mode else _KG_NODES
+    icons  = {n[0]: n[1] for n in node_list}
+    labels = {n[0]: n[2] for n in node_list}
     items  = []
-    for name, _, _ in _KG_NODES:
+    for name, _, _ in node_list:
         s      = nodes_state.get(name, "pending")
         prefix = {"running": "⟳ ", "done": "✓ ", "error": "✗ "}.get(s, "○ ")
         items.append(
@@ -1327,8 +1352,8 @@ def _render_kg_graph(graph_data: Dict) -> None:
 def _kg_view() -> None:
     st.markdown(
         '<div class="hero"><div class="hero-title">Knowledge Graph</div>'
-        '<div class="hero-sub">Convert an OWL ontology to Cypher (Neo4j) or Gremlin, '
-        'execute it on a live graph database, and explore the result interactively.</div></div>',
+        '<div class="hero-sub">Generate a new graph from an OWL ontology, incrementally update '
+        'an existing graph, or load a graph already stored in your database.</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1340,12 +1365,23 @@ def _kg_view() -> None:
         )
         return
 
+    # ── Mode selector ─────────────────────────────────────────────────────────
+    kg_mode = st.radio(
+        "Operation",
+        ["🆕 Generate New Graph", "🔄 Incremental Update", "📥 Load Existing Graph"],
+        horizontal=True,
+        key="kg_mode_radio",
+    )
+    is_load   = kg_mode == "📥 Load Existing Graph"
+    is_update = kg_mode == "🔄 Incremental Update"
+
     onto_jobs = [j for j in onto_api.list_jobs() if j.get("status") == "done"]
-    if not onto_jobs:
+    if not is_load and not onto_jobs:
         st.markdown(
             '<div class="empty-state"><div class="empty-state-icon">🕸️</div>'
             '<div class="empty-state-text">No ontologies available. '
-            'Generate an ontology in the Ontology Generator first.</div></div>',
+            'Generate an ontology in the Ontology Generator first, or choose '
+            '"Load Existing Graph" to query a previously built graph.</div></div>',
             unsafe_allow_html=True,
         )
         return
@@ -1356,15 +1392,18 @@ def _kg_view() -> None:
     with col_cfg:
         st.markdown('<div class="sec-head">⚙️ Knowledge Graph Settings</div>', unsafe_allow_html=True)
 
-        onto_options = {
-            f'{j.get("ontology_name","Ontology")}  ·  '
-            f'{j.get("serialize_format","turtle").upper()}  ·  '
-            f'{j.get("class_count",0)} classes  ·  '
-            f'{j.get("triple_count",0)} triples': j["id"]
-            for j in onto_jobs
-        }
-        selected_onto_label = st.selectbox("Source ontology", list(onto_options.keys()))
-        onto_job_id = onto_options[selected_onto_label]
+        # Ontology selector — only for generate/update modes
+        onto_job_id = None
+        if not is_load:
+            onto_options = {
+                f'{j.get("ontology_name","Ontology")}  ·  '
+                f'{j.get("serialize_format","turtle").upper()}  ·  '
+                f'{j.get("class_count",0)} classes  ·  '
+                f'{j.get("triple_count",0)} triples': j["id"]
+                for j in onto_jobs
+            }
+            selected_onto_label = st.selectbox("Source ontology", list(onto_options.keys()))
+            onto_job_id = onto_options[selected_onto_label]
 
         graph_type = st.radio("Target graph database", ["Neo4j (Cypher)", "Gremlin (TinkerPop)"],
                               horizontal=True)
@@ -1374,25 +1413,41 @@ def _kg_view() -> None:
 
         if use_neo4j:
             neo4j_uri  = st.text_input("Neo4j Bolt URI", value="bolt://localhost:7687",
-                                       placeholder="bolt://localhost:7687")
+                                       placeholder="bolt://localhost:7687", key="kg_neo4j_uri")
             c1, c2 = st.columns(2)
-            neo4j_user = c1.text_input("Username", value="neo4j")
-            neo4j_pass = c2.text_input("Password", type="password")
-            neo4j_db   = st.text_input("Database", value="neo4j")
+            neo4j_user = c1.text_input("Username", value="neo4j", key="kg_neo4j_user")
+            neo4j_pass = c2.text_input("Password", type="password", key="kg_neo4j_pass")
+            neo4j_db   = st.text_input("Database", value="neo4j", key="kg_neo4j_db")
             gremlin_url = gremlin_src = ""
         else:
             gremlin_url = st.text_input("Gremlin WebSocket URL",
                                         value="ws://localhost:8182/gremlin",
-                                        placeholder="ws://localhost:8182/gremlin")
-            gremlin_src = st.text_input("Traversal source", value="g")
+                                        placeholder="ws://localhost:8182/gremlin",
+                                        key="kg_gremlin_url")
+            gremlin_src = st.text_input("Traversal source", value="g", key="kg_gremlin_src")
             neo4j_uri = neo4j_user = neo4j_pass = neo4j_db = ""
 
-        clear_existing = st.checkbox("Clear existing graph before loading", value=False)
-        execute_now    = st.checkbox("Execute on graph database (uncheck for preview only)",
-                                     value=True)
+        # Mode-specific options
+        if is_load:
+            st.info("📥 Loads all nodes and edges already stored in the connected graph database.")
+            clear_existing = False
+            execute_now    = True
+        elif is_update:
+            st.info("🔄 Merges new nodes and relationships into the existing graph without clearing it.")
+            clear_existing = False
+            execute_now    = st.checkbox("Execute on graph database (uncheck for preview only)",
+                                         value=True, key="kg_execute_now")
+        else:
+            clear_existing = st.checkbox("Clear existing graph before loading", value=False,
+                                          key="kg_clear_existing")
+            execute_now    = st.checkbox("Execute on graph database (uncheck for preview only)",
+                                         value=True, key="kg_execute_now_gen")
 
-        gen_btn = st.button(
-            "🕸️  Create Knowledge Graph", type="primary", use_container_width=True,
+        btn_label = ("📥  Load from Database" if is_load
+                     else "🔄  Incremental Update" if is_update
+                     else "🕸️  Create Knowledge Graph")
+        action_btn = st.button(
+            btn_label, type="primary", use_container_width=True,
             disabled=bool(st.session_state.kg_job_id),
         )
 
@@ -1402,7 +1457,10 @@ def _kg_view() -> None:
         prog_area  = st.empty()
         error_area = st.empty()
 
-        job_id = st.session_state.kg_job_id
+        job_id        = st.session_state.kg_job_id
+        active_mode   = st.session_state.kg_mode
+        load_progress = (active_mode == "load")
+
         if job_id:
             try:
                 status = kg_api.get_job(job_id)
@@ -1415,13 +1473,14 @@ def _kg_view() -> None:
             if status:
                 completed = set(status.get("completed_nodes") or [])
                 current   = status.get("current_node") or ""
+                node_list = _KG_LOAD_NODES if load_progress else _KG_NODES
                 ns_map    = {
                     name: ("done"    if name in completed else
                            "running" if name == current and status["status"] == "running" else
                            "pending")
-                    for name, _, _ in _KG_NODES
+                    for name, _, _ in node_list
                 }
-                prog_area.markdown(_kg_node_html(ns_map), unsafe_allow_html=True)
+                prog_area.markdown(_kg_node_html(ns_map, load_progress), unsafe_allow_html=True)
 
                 if status["status"] == "done":
                     try:
@@ -1437,7 +1496,7 @@ def _kg_view() -> None:
                     for k in ns_map:
                         if ns_map[k] == "running":
                             ns_map[k] = "error"
-                    prog_area.markdown(_kg_node_html(ns_map), unsafe_allow_html=True)
+                    prog_area.markdown(_kg_node_html(ns_map, load_progress), unsafe_allow_html=True)
                     error_area.markdown(
                         f'<div class="banner-err">⚠ Pipeline failed: '
                         f'{status.get("error","unknown error")}</div>',
@@ -1448,46 +1507,72 @@ def _kg_view() -> None:
                     time.sleep(1.5)
                     st.rerun()
         else:
-            prog_area.markdown(_kg_node_html({n[0]: "pending" for n in _KG_NODES}),
-                               unsafe_allow_html=True)
+            node_list = _KG_LOAD_NODES if is_load else _KG_NODES
+            prog_area.markdown(
+                _kg_node_html({n[0]: "pending" for n in node_list}, is_load),
+                unsafe_allow_html=True,
+            )
 
     # ── Trigger ───────────────────────────────────────────────────────────────
-    if gen_btn:
-        try:
-            onto_content = onto_api.get_content(onto_job_id)
-            ontology_text   = onto_content.get("content", "")
-            ontology_format = onto_content.get("format", "turtle")
-        except Exception as e:
-            st.error(f"Could not fetch ontology content: {e}")
-            return
-
-        payload = {
-            "ontology_text":   ontology_text,
-            "ontology_format": ontology_format,
-            "graph_type":      "neo4j" if use_neo4j else "gremlin",
-            "clear_existing":  clear_existing,
-        }
-        if use_neo4j and execute_now:
-            payload.update({
+    if action_btn:
+        db_conn = {}
+        if use_neo4j:
+            db_conn = {
                 "neo4j_uri":      neo4j_uri.strip(),
                 "neo4j_username": neo4j_user.strip(),
                 "neo4j_password": neo4j_pass,
                 "neo4j_database": neo4j_db.strip() or "neo4j",
-            })
-        elif not use_neo4j and execute_now:
-            payload.update({
+            }
+        else:
+            db_conn = {
                 "gremlin_url":              gremlin_url.strip(),
                 "gremlin_traversal_source": gremlin_src.strip() or "g",
-            })
+            }
 
-        try:
-            jid = kg_api.generate(payload)
-            st.session_state.kg_job_id    = jid
-            st.session_state.kg_result    = None
-            st.session_state.kg_graph_data = None
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to start KG generation: {e}")
+        if is_load:
+            # Load existing graph — no ontology needed
+            payload = {
+                "graph_type": "neo4j" if use_neo4j else "gremlin",
+                **db_conn,
+            }
+            try:
+                jid = kg_api.fetch(payload)
+                st.session_state.kg_job_id    = jid
+                st.session_state.kg_result    = None
+                st.session_state.kg_graph_data = None
+                st.session_state.kg_mode      = "load"
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to start load job: {e}")
+        else:
+            # Generate new or incremental update — needs ontology
+            try:
+                onto_content    = onto_api.get_content(onto_job_id)
+                ontology_text   = onto_content.get("content", "")
+                ontology_format = onto_content.get("format", "turtle")
+            except Exception as e:
+                st.error(f"Could not fetch ontology content: {e}")
+                return
+
+            payload = {
+                "ontology_text":   ontology_text,
+                "ontology_format": ontology_format,
+                "graph_type":      "neo4j" if use_neo4j else "gremlin",
+                "mode":            "update" if is_update else "generate",
+                "clear_existing":  clear_existing,
+            }
+            if execute_now:
+                payload.update(db_conn)
+
+            try:
+                jid = kg_api.generate(payload)
+                st.session_state.kg_job_id    = jid
+                st.session_state.kg_result    = None
+                st.session_state.kg_graph_data = None
+                st.session_state.kg_mode      = "update" if is_update else "generate"
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to start KG job: {e}")
         return
 
     # ── Result panel ──────────────────────────────────────────────────────────
@@ -1507,10 +1592,13 @@ def _kg_view() -> None:
             for j in done_jobs:
                 cols = st.columns([7, 2])
                 with cols[0]:
-                    gtype = j.get("graph_type", "neo4j").upper()
+                    gtype    = j.get("graph_type", "neo4j").upper()
+                    job_mode = j.get("mode", "generate")
+                    mode_tag = {"load": "📥 Loaded", "update": "🔄 Updated"}.get(job_mode, "🆕 Generated")
                     st.markdown(
                         f'<div class="hcard">'
-                        f'<div class="hcard-title">🕸️ {gtype} Knowledge Graph</div>'
+                        f'<div class="hcard-title">🕸️ {gtype} Knowledge Graph &nbsp; '
+                        f'<span style="font-size:0.75rem;opacity:0.7">{mode_tag}</span></div>'
                         f'<div class="hcard-meta">'
                         f'{j.get("node_count",0)} nodes &nbsp;·&nbsp; '
                         f'{j.get("edge_count",0)} edges &nbsp;·&nbsp; '
@@ -1535,7 +1623,11 @@ def _kg_view() -> None:
         unsafe_allow_html=True,
     )
     executed = result.get("executed_count", 0)
-    mode_lbl = f"{executed} queries executed" if executed else "Preview mode (no DB execution)"
+    job_mode = result.get("mode", "generate")
+    mode_tag = {"load": "loaded from database", "update": "incrementally updated"}.get(
+        job_mode, f"{executed} queries executed" if executed else "preview mode"
+    )
+    mode_lbl = mode_tag
     st.markdown(
         f'<div class="banner-ok" style="margin-bottom:1rem">✓ Knowledge graph ready — {mode_lbl}</div>',
         unsafe_allow_html=True,
@@ -1851,20 +1943,75 @@ def _dialog_view() -> None:
     result = st.session_state.dialog_result
 
     if not result or st.session_state.dialog_job_id:
-        # Show list of previous dialog sessions
+        hr = "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>"
+
+        # ── Cached NLQs ───────────────────────────────────────────────────────
+        cached_list = dialog_api.list_cache()
+        if cached_list:
+            st.markdown(hr, unsafe_allow_html=True)
+            cache_head_cols = st.columns([6, 3])
+            cache_head_cols[0].markdown(
+                '<div class="sec-head">💾 Cached Queries</div>', unsafe_allow_html=True
+            )
+            with cache_head_cols[1]:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🗑 Clear all cache", key="dialog_clear_cache"):
+                    n = dialog_api.clear_cache()
+                    st.success(f"Cleared {n} cached entr{'y' if n == 1 else 'ies'}.")
+                    st.rerun()
+
+            for entry in cached_list:
+                ck   = entry.get("cache_key", "")
+                nq   = entry.get("natural_query", "?")
+                dbfp = entry.get("db_fingerprint", "")
+                kgfp = entry.get("kg_fingerprint", "")
+                cat  = entry.get("cached_at", "")[:19].replace("T", " ")
+                cols = st.columns([6, 1, 1])
+                with cols[0]:
+                    st.markdown(
+                        f'<div class="hcard">'
+                        f'<div class="hcard-title">💾 {nq[:90]}</div>'
+                        f'<div class="hcard-meta">'
+                        f'{dbfp} &nbsp;·&nbsp; {kgfp} &nbsp;·&nbsp; cached {cat}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with cols[1]:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("⚡ Use", key=f"cache_use_{ck[:12]}"):
+                        # Submit a new query that will hit the cache instantly
+                        payload_cached: Dict[str, Any] = {
+                            "natural_query": nq,
+                            "kg_nodes":      [],
+                            "kg_edges":      [],
+                            "skip_cache":    False,
+                        }
+                        try:
+                            resp = dialog_api.query(payload_cached)
+                            jid  = resp if isinstance(resp, str) else resp
+                            st.session_state.dialog_job_id = jid
+                            st.session_state.dialog_result  = None
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not load from cache: {e}")
+                with cols[2]:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🗑", key=f"cache_del_{ck[:12]}"):
+                        dialog_api.delete_cache_entry(ck)
+                        st.rerun()
+
+        # ── Previous dialog sessions ──────────────────────────────────────────
         done_list = [j for j in dialog_api.list_jobs() if j.get("status") == "done"]
         if done_list:
-            st.markdown(
-                "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(hr, unsafe_allow_html=True)
             st.markdown('<div class="sec-head">📚 Previous Dialogs</div>', unsafe_allow_html=True)
             for j in done_list:
                 cols = st.columns([7, 2])
                 with cols[0]:
+                    cache_badge = ' &nbsp;<span style="font-size:0.7rem;color:#68d391">⚡ cached</span>' if j.get("cache_hit") else ""
                     st.markdown(
                         f'<div class="hcard">'
-                        f'<div class="hcard-title">💬 {j.get("natural_query","?")[:80]}</div>'
+                        f'<div class="hcard-title">💬 {j.get("natural_query","?")[:80]}{cache_badge}</div>'
                         f'<div class="hcard-meta">'
                         f'{j.get("db_type","?").upper()} &nbsp;·&nbsp; '
                         f'{j.get("query_count",0)} queries &nbsp;·&nbsp; '
@@ -1889,9 +2036,11 @@ def _dialog_view() -> None:
     )
     q_count = result.get("query_count", len(result.get("sql_queries") or []))
     r_count = result.get("result_count", len(result.get("query_results") or []))
+    cache_hit = result.get("cache_hit", False)
+    banner_suffix = " &nbsp;⚡ <em>served from cache</em>" if cache_hit else ""
     st.markdown(
         f'<div class="banner-ok" style="margin-bottom:1rem">'
-        f'✓ Analysis complete — {q_count} queries planned, {r_count} executed</div>',
+        f'✓ Analysis complete — {q_count} queries planned, {r_count} executed{banner_suffix}</div>',
         unsafe_allow_html=True,
     )
 

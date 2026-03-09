@@ -1,12 +1,15 @@
 """
 Knowledge Graph Agent — LangGraph pipeline.
 
-Graph topology:
+Graph topology (mode = "generate" or "update"):
     START → parse → [error] → error_end → END
                  → translate → execute → END
 
+Graph topology (mode = "load"):
+    START → fetch → END
+
 Completely decoupled from metadata_agent and ontology_agent.
-The only inputs are a raw ontology string and a KGConfig.
+Inputs: raw ontology string + KGConfig (generate/update), or just KGConfig (load).
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ from typing import Any, Dict, Optional
 from langgraph.graph import END, START, StateGraph
 
 from .config import KGConfig
-from .nodes import execute_node, parse_node, translate_node
+from .nodes import execute_node, fetch_node, parse_node, translate_node
 from .state import KGState
 
 logger = logging.getLogger(__name__)
@@ -24,12 +27,21 @@ logger = logging.getLogger(__name__)
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 
+def _route_from_start(state: KGState) -> str:
+    """Route to fetch_node for load mode, otherwise run the full pipeline."""
+    return "fetch" if state["config"].mode == "load" else "parse"
+
+
 def _route_after_parse(state: KGState) -> str:
     return "error_end" if state.get("phase") == "error" else "translate"
 
 
 def _route_after_translate(state: KGState) -> str:
     return "error_end" if state.get("phase") == "error" else "execute"
+
+
+def _route_after_fetch(state: KGState) -> str:
+    return "error_end" if state.get("phase") == "error" else END
 
 
 def _error_end_node(state: KGState) -> KGState:
@@ -45,9 +57,14 @@ def _build_graph() -> Any:
     graph.add_node("parse",     parse_node)
     graph.add_node("translate", translate_node)
     graph.add_node("execute",   execute_node)
+    graph.add_node("fetch",     fetch_node)
     graph.add_node("error_end", _error_end_node)
 
-    graph.add_edge(START, "parse")
+    graph.add_conditional_edges(
+        START,
+        _route_from_start,
+        {"parse": "parse", "fetch": "fetch"},
+    )
     graph.add_conditional_edges(
         "parse",
         _route_after_parse,
@@ -57,6 +74,11 @@ def _build_graph() -> Any:
         "translate",
         _route_after_translate,
         {"execute": "execute", "error_end": "error_end"},
+    )
+    graph.add_conditional_edges(
+        "fetch",
+        _route_after_fetch,
+        {END: END, "error_end": "error_end"},
     )
     graph.add_edge("execute",   END)
     graph.add_edge("error_end", END)
@@ -68,25 +90,32 @@ def _build_graph() -> Any:
 
 class KGAgent:
     """
-    Convert an OWL/RDF ontology to a Cypher or Gremlin knowledge graph.
+    Convert an OWL/RDF ontology to a Cypher or Gremlin knowledge graph,
+    incrementally update an existing graph, or load a graph already stored
+    in the database for visualisation.
 
-    Usage::
+    Usage (generate / update)::
 
         cfg    = KGConfig(graph_type="neo4j", neo4j_uri="bolt://localhost:7687",
-                          neo4j_username="neo4j", neo4j_password="secret")
+                          neo4j_username="neo4j", neo4j_password="secret",
+                          mode="generate")   # or "update" for incremental
         agent  = KGAgent(cfg)
         result = agent.run(turtle_text)
-        # result["queries"]    — list of Cypher/Gremlin statements
-        # result["graph_data"] — {nodes, edges} for visualisation
-        # result["node_count"] — number of OWL classes converted
-        # result["edge_count"] — number of object properties converted
+
+    Usage (load existing graph)::
+
+        cfg    = KGConfig(graph_type="neo4j", neo4j_uri="bolt://localhost:7687",
+                          neo4j_username="neo4j", neo4j_password="secret",
+                          mode="load")
+        agent  = KGAgent(cfg)
+        result = agent.load()
     """
 
     def __init__(self, config: Optional[KGConfig] = None):
         self._config = config or KGConfig()
         self._graph  = _build_graph()
 
-    def _initial_state(self, ontology_text: str, ontology_format: str = "turtle") -> KGState:
+    def _initial_state(self, ontology_text: str = "", ontology_format: str = "turtle") -> KGState:
         return {
             "config":            self._config,
             "ontology_text":     ontology_text,
@@ -102,11 +131,7 @@ class KGAgent:
             "phase":             "init",
         }
 
-    def run(self, ontology_text: str, ontology_format: str = "turtle") -> Dict:
-        """Synchronous execution — returns a result summary dict."""
-        final = self._graph.invoke(self._initial_state(ontology_text, ontology_format))
-        for err in final.get("errors", []):
-            logger.warning("KG warning: %s", err)
+    def _to_result(self, final: Dict) -> Dict:
         return {
             "queries":           final.get("queries", []),
             "graph_data":        final.get("graph_data", {"nodes": [], "edges": []}),
@@ -118,8 +143,28 @@ class KGAgent:
             "phase":             final.get("phase", ""),
         }
 
+    def run(self, ontology_text: str, ontology_format: str = "turtle") -> Dict:
+        """Synchronous generate/update execution — returns a result summary dict."""
+        final = self._graph.invoke(self._initial_state(ontology_text, ontology_format))
+        for err in final.get("errors", []):
+            logger.warning("KG warning: %s", err)
+        return self._to_result(final)
+
+    def load(self) -> Dict:
+        """Synchronous load execution — fetches existing graph from the DB."""
+        final = self._graph.invoke(self._initial_state())
+        for err in final.get("errors", []):
+            logger.warning("KG load warning: %s", err)
+        return self._to_result(final)
+
     def stream_run(self, ontology_text: str, ontology_format: str = "turtle"):
         """Yield (node_name, state_update) as each pipeline node completes."""
         for event in self._graph.stream(self._initial_state(ontology_text, ontology_format)):
+            for node_name, state_update in event.items():
+                yield node_name, state_update
+
+    def stream_load(self):
+        """Yield (node_name, state_update) for the load pipeline."""
+        for event in self._graph.stream(self._initial_state()):
             for node_name, state_update in event.items():
                 yield node_name, state_update

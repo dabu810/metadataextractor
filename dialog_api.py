@@ -5,6 +5,10 @@ Standalone microservice — completely independent of all other agents.
 Accepts a natural language query + KG graph data + DB connection config,
 decomposes it into SQL, executes against the target DB, and returns insights.
 
+NLQ caching: completed query results are cached in memory by a fingerprint of
+(natural_query, db_type, db_host, db_name, db_schema, kg node labels).  A cache
+hit returns instantly without re-running the LLM pipeline.
+
 Endpoints
 ---------
 GET  /health
@@ -12,14 +16,20 @@ POST /query                  start async dialog job → {job_id}
 GET  /jobs/{job_id}          poll status + summary stats
 GET  /jobs/{job_id}/results  get full results (queries + rows + insights)
 GET  /list                   list all dialog jobs
+GET  /cache                  list all cached NLQ entries
+DELETE /cache/{cache_key}    invalidate a specific cache entry
+DELETE /cache                clear the entire NLQ cache
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
 import threading
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,7 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Dialog with Data Agent API", version="1.0.0", docs_url="/docs")
+app = FastAPI(title="Dialog with Data Agent API", version="1.1.0", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,10 +60,51 @@ app.add_middleware(
 _jobs: Dict[str, Dict] = {}
 _lock = threading.Lock()
 
+# ── NLQ cache ─────────────────────────────────────────────────────────────────
+# Maps cache_key → {cache_key, natural_query, db_fingerprint, kg_fingerprint,
+#                   cached_at, job_id, insights, sql_queries, query_results, errors}
+_nlq_cache: Dict[str, Dict] = {}
+_cache_lock = threading.Lock()
+
 DIALOG_NODES = ["understand", "plan", "execute", "synthesize"]
 
 
+# ── Cache helpers ──────────────────────────────────────────────────────────────
+
+def _cache_key(
+    natural_query: str,
+    db_type: str,
+    db_host: str,
+    db_port: int,
+    db_name: str,
+    db_schema: str,
+    kg_nodes: List[Dict],
+) -> str:
+    """Stable fingerprint for a (query, db, schema, kg) combination."""
+    kg_labels = ",".join(sorted(n.get("label", "") for n in kg_nodes if n.get("label")))
+    raw = "|".join([
+        natural_query.strip().lower(),
+        db_type.lower(),
+        db_host.lower(),
+        str(db_port),
+        db_name.lower(),
+        db_schema.lower(),
+        kg_labels,
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _db_fingerprint(db_type: str, db_host: str, db_port: int, db_name: str, db_schema: str) -> str:
+    return f"{db_type}://{db_host}:{db_port}/{db_name}/{db_schema}"
+
+
+def _kg_fingerprint(kg_nodes: List[Dict]) -> str:
+    labels = sorted(n.get("label", "") for n in kg_nodes if n.get("label"))
+    return f"{len(labels)} tables: {', '.join(labels[:10])}" + ("…" if len(labels) > 10 else "")
+
+
 # ── Request models ─────────────────────────────────────────────────────────────
+
 class QueryRequest(BaseModel):
     natural_query: str
 
@@ -77,14 +128,21 @@ class QueryRequest(BaseModel):
     row_limit:       int = 500
     llm_model:       str = "claude-sonnet-4-6"
 
+    # Cache control
+    skip_cache: bool = False   # Set True to force a fresh run even if cached
+
 
 # ── Background runner ──────────────────────────────────────────────────────────
+
 def _run_dialog(
     job_id: str,
     natural_query: str,
     kg_nodes: List[Dict],
     kg_edges: List[Dict],
     cfg: DialogConfig,
+    cache_key: str,
+    db_fingerprint: str,
+    kg_fingerprint: str,
 ) -> None:
     with _lock:
         _jobs[job_id]["status"] = "running"
@@ -117,6 +175,22 @@ def _run_dialog(
                 "errors":          result.get("errors") or [],
             })
 
+        # Store in NLQ cache
+        with _cache_lock:
+            _nlq_cache[cache_key] = {
+                "cache_key":      cache_key,
+                "natural_query":  natural_query,
+                "db_fingerprint": db_fingerprint,
+                "kg_fingerprint": kg_fingerprint,
+                "cached_at":      datetime.now(timezone.utc).isoformat(),
+                "job_id":         job_id,
+                "insights":       result.get("insights", ""),
+                "sql_queries":    result.get("sql_queries") or [],
+                "query_results":  result.get("query_results") or [],
+                "errors":         result.get("errors") or [],
+            }
+            logger.info("NLQ cached: key=%s", cache_key[:12])
+
     except Exception as exc:
         logger.exception("Dialog job %s failed", job_id)
         with _lock:
@@ -125,6 +199,7 @@ def _run_dialog(
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -150,8 +225,42 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         row_limit            = req.row_limit,
     )
 
-    job_id = str(uuid.uuid4())
+    ck = _cache_key(
+        req.natural_query, req.db_type, req.db_host,
+        req.db_port, req.db_name, req.db_schema, req.kg_nodes,
+    )
+    dbfp = _db_fingerprint(req.db_type, req.db_host, req.db_port, req.db_name, req.db_schema)
+    kgfp = _kg_fingerprint(req.kg_nodes)
 
+    # ── Cache hit: synthesize a completed job from cached data ─────────────────
+    if not req.skip_cache:
+        with _cache_lock:
+            cached = _nlq_cache.get(ck)
+        if cached:
+            logger.info("NLQ cache HIT: key=%s", ck[:12])
+            job_id = str(uuid.uuid4())
+            with _lock:
+                _jobs[job_id] = {
+                    "id":              job_id,
+                    "natural_query":   req.natural_query,
+                    "db_type":         req.db_type,
+                    "status":          "done",
+                    "current_node":    "synthesize",
+                    "completed_nodes": list(DIALOG_NODES),
+                    "query_count":     len(cached.get("sql_queries") or []),
+                    "result_count":    len(cached.get("query_results") or []),
+                    "insights":        cached.get("insights", ""),
+                    "sql_queries":     cached.get("sql_queries") or [],
+                    "query_results":   cached.get("query_results") or [],
+                    "errors":          cached.get("errors") or [],
+                    "error":           None,
+                    "cache_hit":       True,
+                    "cache_key":       ck,
+                }
+            return {"job_id": job_id, "cache_hit": True}
+
+    # ── Cache miss: run the full pipeline ─────────────────────────────────────
+    job_id = str(uuid.uuid4())
     with _lock:
         _jobs[job_id] = {
             "id":              job_id,
@@ -167,13 +276,16 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
             "query_results":   [],
             "errors":          [],
             "error":           None,
+            "cache_hit":       False,
+            "cache_key":       ck,
         }
 
     background_tasks.add_task(
         _run_dialog, job_id,
-        req.natural_query, req.kg_nodes, req.kg_edges, cfg,
+        req.natural_query, req.kg_nodes, req.kg_edges,
+        cfg, ck, dbfp, kgfp,
     )
-    return {"job_id": job_id}
+    return {"job_id": job_id, "cache_hit": False}
 
 
 @app.get("/jobs/{job_id}")
@@ -182,7 +294,6 @@ def get_job(job_id: str):
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Exclude large blobs from the status poll endpoint
     return {k: v for k, v in job.items()
             if k not in ("sql_queries", "query_results")}
 
@@ -201,6 +312,7 @@ def get_results(job_id: str):
         "sql_queries":    job["sql_queries"],
         "query_results":  job["query_results"],
         "errors":         job["errors"],
+        "cache_hit":      job.get("cache_hit", False),
     }
 
 
@@ -212,3 +324,37 @@ def list_jobs():
         {k: v for k, v in j.items() if k not in ("sql_queries", "query_results")}
         for j in jobs
     ]
+
+
+# ── NLQ Cache endpoints ────────────────────────────────────────────────────────
+
+@app.get("/cache")
+def list_cache():
+    """List all cached NLQ entries (without the full result blobs)."""
+    with _cache_lock:
+        entries = list(_nlq_cache.values())
+    return [
+        {k: v for k, v in e.items() if k not in ("sql_queries", "query_results")}
+        for e in entries
+    ]
+
+
+@app.delete("/cache/{cache_key}", status_code=200)
+def delete_cache_entry(cache_key: str):
+    """Invalidate a single cached NLQ entry by its cache key."""
+    with _cache_lock:
+        if cache_key not in _nlq_cache:
+            raise HTTPException(status_code=404, detail="Cache entry not found")
+        del _nlq_cache[cache_key]
+    logger.info("NLQ cache entry deleted: key=%s", cache_key[:12])
+    return {"deleted": cache_key}
+
+
+@app.delete("/cache", status_code=200)
+def clear_cache():
+    """Clear the entire NLQ cache."""
+    with _cache_lock:
+        count = len(_nlq_cache)
+        _nlq_cache.clear()
+    logger.info("NLQ cache cleared: %d entries removed", count)
+    return {"deleted_count": count}

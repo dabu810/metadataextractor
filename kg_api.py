@@ -9,7 +9,8 @@ for visualisation in the UI.
 Endpoints
 ---------
 GET  /health
-POST /generate                    start async KG creation → {job_id}
+POST /generate                    start async KG creation/update job → {job_id}
+POST /fetch                       load existing graph from DB → {job_id}
 GET  /jobs/{job_id}               poll status + stats
 GET  /jobs/{job_id}/graph         get {nodes, edges} for UI visualisation
 GET  /jobs/{job_id}/queries       get the generated Cypher/Gremlin statements
@@ -40,7 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Knowledge Graph Agent API", version="1.0.0", docs_url="/docs")
+app = FastAPI(title="Knowledge Graph Agent API", version="1.1.0", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,10 +53,12 @@ app.add_middleware(
 _jobs: Dict[str, Dict] = {}
 _lock = threading.Lock()
 
-KG_NODES = ["parse", "translate", "execute"]
+KG_NODES       = ["parse", "translate", "execute"]
+KG_LOAD_NODES  = ["fetch"]
 
 
 # ── Request models ─────────────────────────────────────────────────────────────
+
 class GenerateRequest(BaseModel):
     ontology_text:   str
     ontology_format: str = "turtle"     # "turtle" | "xml" | "n3"
@@ -71,15 +74,54 @@ class GenerateRequest(BaseModel):
     gremlin_url:              str = ""
     gremlin_traversal_source: str = "g"
 
-    # Behaviour
+    # Behaviour: "generate" (default) | "update" (incremental, never clears)
+    mode:           str  = "generate"
     clear_existing: bool = False
 
 
-# ── Background runner ──────────────────────────────────────────────────────────
+class FetchRequest(BaseModel):
+    """Load an existing graph from the graph database (no ontology needed)."""
+    graph_type: str = "neo4j"      # "neo4j" | "gremlin"
+
+    neo4j_uri:      str = ""
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = ""
+    neo4j_database: str = "neo4j"
+
+    gremlin_url:              str = ""
+    gremlin_traversal_source: str = "g"
+
+
+# ── Job record helpers ─────────────────────────────────────────────────────────
+
+def _new_job(job_id: str, graph_type: str, ontology_format: str, mode: str) -> Dict:
+    return {
+        "id":                job_id,
+        "graph_type":        graph_type,
+        "ontology_format":   ontology_format,
+        "mode":              mode,
+        "status":            "queued",
+        "current_node":      None,
+        "completed_nodes":   [],
+        "node_count":        0,
+        "edge_count":        0,
+        "executed_count":    0,
+        "graph_data":        {"nodes": [], "edges": []},
+        "queries":           [],
+        "execution_results": [],
+        "errors":            [],
+        "error":             None,
+    }
+
+
+# ── Background runners ─────────────────────────────────────────────────────────
+
 def _run_kg(job_id: str, ontology_text: str, ontology_format: str, cfg: KGConfig) -> None:
+    """Background task for generate / update modes."""
     with _lock:
         _jobs[job_id]["status"] = "running"
 
+    pipeline_nodes = KG_NODES
     completed: List[str] = []
     try:
         agent = KGAgent(cfg)
@@ -91,19 +133,19 @@ def _run_kg(job_id: str, ontology_text: str, ontology_format: str, cfg: KGConfig
                     _jobs[job_id]["status"] = "error"
                     _jobs[job_id]["error"]  = f"Pipeline error at node: {node_name}"
                     return
-                real = clean if clean in KG_NODES else None
+                real = clean if clean in pipeline_nodes else None
                 if real and real not in completed:
                     completed.append(real)
                 _jobs[job_id]["completed_nodes"] = list(completed)
                 _jobs[job_id]["current_node"]    = clean
 
-        # Run synchronously to get the full result
+        # Run synchronously to capture final result
         result = agent.run(ontology_text, ontology_format)
 
         with _lock:
             _jobs[job_id].update({
                 "status":           "done",
-                "completed_nodes":  list(KG_NODES),
+                "completed_nodes":  list(pipeline_nodes),
                 "current_node":     "execute",
                 "node_count":       result["node_count"],
                 "edge_count":       result["edge_count"],
@@ -121,7 +163,49 @@ def _run_kg(job_id: str, ontology_text: str, ontology_format: str, cfg: KGConfig
             _jobs[job_id]["error"]  = str(exc)
 
 
+def _run_fetch(job_id: str, cfg: KGConfig) -> None:
+    """Background task for load mode — fetch existing graph from DB."""
+    with _lock:
+        _jobs[job_id]["status"] = "running"
+
+    try:
+        agent = KGAgent(cfg)
+
+        for node_name, state_update in agent.stream_load():
+            clean = node_name.strip("_").replace("error_end", "error")
+            with _lock:
+                if "error" in node_name:
+                    _jobs[job_id]["status"] = "error"
+                    _jobs[job_id]["error"]  = f"Fetch error at node: {node_name}"
+                    return
+                if clean in KG_LOAD_NODES and clean not in _jobs[job_id]["completed_nodes"]:
+                    _jobs[job_id]["completed_nodes"].append(clean)
+                _jobs[job_id]["current_node"] = clean
+
+        result = agent.load()
+
+        with _lock:
+            _jobs[job_id].update({
+                "status":          "done",
+                "completed_nodes": list(KG_LOAD_NODES),
+                "current_node":    "fetch",
+                "node_count":      result["node_count"],
+                "edge_count":      result["edge_count"],
+                "executed_count":  0,
+                "graph_data":      result["graph_data"],
+                "queries":         [],
+                "errors":          result["errors"],
+            })
+
+    except Exception as exc:
+        logger.exception("KG fetch job %s failed", job_id)
+        with _lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"]  = str(exc)
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -133,6 +217,11 @@ def generate_kg(req: GenerateRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="ontology_text must not be empty")
     if req.graph_type not in ("neo4j", "gremlin"):
         raise HTTPException(status_code=400, detail="graph_type must be 'neo4j' or 'gremlin'")
+    if req.mode not in ("generate", "update"):
+        raise HTTPException(status_code=400, detail="mode must be 'generate' or 'update'")
+
+    # "update" mode forces clear_existing=False so existing data is preserved
+    clear = req.clear_existing if req.mode == "generate" else False
 
     cfg = KGConfig(
         graph_type               = req.graph_type,
@@ -142,32 +231,52 @@ def generate_kg(req: GenerateRequest, background_tasks: BackgroundTasks):
         neo4j_database           = req.neo4j_database,
         gremlin_url              = req.gremlin_url,
         gremlin_traversal_source = req.gremlin_traversal_source,
-        clear_existing           = req.clear_existing,
+        mode                     = req.mode,
+        clear_existing           = clear,
     )
 
     job_id = str(uuid.uuid4())
-
     with _lock:
-        _jobs[job_id] = {
-            "id":                job_id,
-            "graph_type":        req.graph_type,
-            "ontology_format":   req.ontology_format,
-            "status":            "queued",
-            "current_node":      None,
-            "completed_nodes":   [],
-            "node_count":        0,
-            "edge_count":        0,
-            "executed_count":    0,
-            "graph_data":        {"nodes": [], "edges": []},
-            "queries":           [],
-            "execution_results": [],
-            "errors":            [],
-            "error":             None,
-        }
+        _jobs[job_id] = _new_job(job_id, req.graph_type, req.ontology_format, req.mode)
 
     background_tasks.add_task(
         _run_kg, job_id, req.ontology_text, req.ontology_format, cfg
     )
+    return {"job_id": job_id}
+
+
+@app.post("/fetch", status_code=202)
+def fetch_graph(req: FetchRequest, background_tasks: BackgroundTasks):
+    """Load an existing knowledge graph from the graph database."""
+    if req.graph_type not in ("neo4j", "gremlin"):
+        raise HTTPException(status_code=400, detail="graph_type must be 'neo4j' or 'gremlin'")
+
+    connected = (
+        (req.graph_type == "neo4j"   and bool(req.neo4j_uri)) or
+        (req.graph_type == "gremlin" and bool(req.gremlin_url))
+    )
+    if not connected:
+        raise HTTPException(
+            status_code=400,
+            detail="A graph database URI is required to load an existing graph",
+        )
+
+    cfg = KGConfig(
+        graph_type               = req.graph_type,
+        neo4j_uri                = req.neo4j_uri,
+        neo4j_username           = req.neo4j_username,
+        neo4j_password           = req.neo4j_password,
+        neo4j_database           = req.neo4j_database,
+        gremlin_url              = req.gremlin_url,
+        gremlin_traversal_source = req.gremlin_traversal_source,
+        mode                     = "load",
+    )
+
+    job_id = str(uuid.uuid4())
+    with _lock:
+        _jobs[job_id] = _new_job(job_id, req.graph_type, "", "load")
+
+    background_tasks.add_task(_run_fetch, job_id, cfg)
     return {"job_id": job_id}
 
 
@@ -177,7 +286,6 @@ def get_job(job_id: str):
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Return everything except the large graph_data and queries blobs
     return {k: v for k, v in job.items() if k not in ("graph_data", "queries", "execution_results")}
 
 
@@ -187,7 +295,7 @@ def get_graph(job_id: str):
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] not in ("done",):
+    if job["status"] != "done":
         raise HTTPException(status_code=202, detail="Graph not yet ready")
     return job["graph_data"]
 
@@ -198,7 +306,7 @@ def get_queries(job_id: str):
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] not in ("done",):
+    if job["status"] != "done":
         raise HTTPException(status_code=202, detail="Queries not yet ready")
     return {
         "graph_type": job["graph_type"],

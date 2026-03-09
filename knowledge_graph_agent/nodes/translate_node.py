@@ -71,12 +71,23 @@ def _extract_ontology(g: Graph) -> Tuple[Dict, List]:
         classes   — {uri_str: {uri, name, comments, datatype_props}}
         obj_props — [{uri, name, domain, range, is_functional, is_inv_functional}]
     """
+    # Namespaces whose URIs should never be treated as domain classes
+    _SKIP_NS = (
+        "http://www.w3.org/2001/XMLSchema#",
+        "http://www.w3.org/2002/07/owl#",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "http://www.w3.org/2000/01/rdf-schema#",
+    )
+
     # --- OWL Classes ---
     classes: Dict[str, Dict] = {}
     for cls_uri in g.subjects(RDF.type, OWL.Class):
         if isinstance(cls_uri, BNode):
             continue
         uri_str = str(cls_uri)
+        # Skip XSD built-ins, OWL/RDF/RDFS meta-vocabulary
+        if any(uri_str.startswith(ns) for ns in _SKIP_NS):
+            continue
         label   = _get_label(g, cls_uri) or _local_name(cls_uri)
         comments = [str(c) for c in g.objects(cls_uri, RDFS.comment)]
         classes[uri_str] = {

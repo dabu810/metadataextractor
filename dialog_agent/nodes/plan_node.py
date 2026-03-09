@@ -135,9 +135,28 @@ def plan_node(state: DialogState) -> DialogState:
 
     db_schema = config.db_schema or ""
 
-    # Extract table labels from KG nodes for the SQL post-processor
+    # Extract table labels from KG nodes for the SQL post-processor.
+    # Exclude XSD data types and SQL/SPARQL keywords that must never be
+    # treated as table names — these can appear as KG node labels when an
+    # ontology generator incorrectly marks xsd:string etc. as owl:Class.
+    _EXCLUDED_LABELS = {
+        "string", "integer", "int", "float", "double", "decimal", "boolean",
+        "date", "datetime", "time", "duration", "anyuri", "literal",
+        "long", "short", "byte", "binary", "hexbinary", "base64binary",
+        "nonnegativeinteger", "positiveinteger", "negativinteger",
+        "unsignedlong", "unsignedint", "unsignedshort", "unsignedbyte",
+        # SQL reserved words that must not be table-qualified
+        "select", "from", "where", "join", "on", "group", "order", "by",
+        "having", "limit", "offset", "as", "and", "or", "not", "null",
+        "true", "false", "case", "when", "then", "else", "end", "in",
+        "between", "like", "is", "distinct", "all", "any", "exists",
+        "union", "intersect", "except", "with", "values", "set",
+    }
     kg_nodes     = state.get("kg_nodes") or []
-    table_labels = [n.get("label", "") for n in kg_nodes if n.get("label")]
+    table_labels = [
+        n.get("label", "") for n in kg_nodes
+        if n.get("label") and n.get("label", "").lower() not in _EXCLUDED_LABELS
+    ]
 
     system = _SYSTEM_PROMPT.format(
         row_limit=config.row_limit,

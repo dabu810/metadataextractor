@@ -88,6 +88,10 @@ class APIClient:
     def search(self, q: str, scope: str = "all", db_type: str = "all") -> List[Dict]:
         return self._get("/search", params={"q": q, "scope": scope, "db_type": db_type})
 
+    def discover(self, payload: Dict) -> Dict:
+        """Return {schemas: [...], tables: {schema: [table, ...]}} for the given DB."""
+        return self._post("/discover", payload)
+
 api = APIClient(AGENT_API_URL)
 
 
@@ -474,7 +478,10 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("kg_job_id", None), ("kg_result", None), ("kg_graph_data", None),
                 ("kg_mode", "generate"),
                 ("dialog_job_id", None), ("dialog_result", None),
-                ("dialog_kg_job_id", None)]:
+                ("dialog_kg_job_id", None),
+                # Schema/table discovery results
+                ("ext_disco", None),    # {schemas:[...], tables:{schema:[...]}}
+                ("dlg_disco", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -632,48 +639,129 @@ def _extract_view() -> None:
 
         if needs_bq:
             c1, c2 = st.columns(2)
-            bq_project = c1.text_input("GCP Project", placeholder="my-gcp-project")
-            bq_dataset = c2.text_input("Dataset (schema)", placeholder="my_dataset")
-            bq_creds   = st.text_input("Service account JSON path", placeholder="/path/to/sa.json")
+            bq_project = c1.text_input("GCP Project", placeholder="my-gcp-project", key="ext_bq_project")
+            bq_dataset = c2.text_input("Dataset (schema)", placeholder="my_dataset", key="ext_bq_dataset")
+            bq_creds   = st.text_input("Service account JSON path", placeholder="/path/to/sa.json", key="ext_bq_creds")
             host = port = database = schema = username = password = ""
             spark_master = http_path = odbc_driver = ""
         elif needs_spark:
             c1, c2 = st.columns(2)
-            host         = c1.text_input("Databricks host", placeholder="adb-xxx.azuredatabricks.net")
-            database     = c1.text_input("Catalog / Database", placeholder="my_catalog")
-            schema       = c2.text_input("Schema", placeholder="my_schema")
-            spark_master = c2.text_input("Spark master (local only)", placeholder="local[*]")
-            http_path    = st.text_input("HTTP path", placeholder="/sql/1.0/warehouses/abc123")
-            password     = st.text_input("Databricks token", type="password")
+            host         = c1.text_input("Databricks host", placeholder="adb-xxx.azuredatabricks.net", key="ext_spark_host")
+            database     = c1.text_input("Catalog / Database", placeholder="my_catalog", key="ext_spark_db")
+            schema       = c2.text_input("Schema", placeholder="my_schema", key="ext_spark_schema")
+            spark_master = c2.text_input("Spark master (local only)", placeholder="local[*]", key="ext_spark_master")
+            http_path    = st.text_input("HTTP path", placeholder="/sql/1.0/warehouses/abc123", key="ext_spark_http")
+            password     = st.text_input("Databricks token", type="password", key="ext_spark_token")
             port         = 443
             username     = ""
             bq_project = bq_dataset = bq_creds = odbc_driver = ""
         else:
             c1, c2 = st.columns([3, 1])
-            host = c1.text_input("Host", placeholder="localhost")
+            host = c1.text_input("Host", placeholder="localhost", key="ext_host")
             defaults = {"postgres": 5432, "oracle": 1521, "sqlserver": 1433,
                         "teradata": 1025, "redshift": 5439}
-            port = c2.number_input("Port", value=defaults.get(db_type, 5432), step=1)
+            port = c2.number_input("Port", value=defaults.get(db_type, 5432), step=1, key="ext_port")
             c3, c4 = st.columns(2)
-            database = c3.text_input("Database / Service name", placeholder="mydb")
-            schema   = c4.text_input("Schema", placeholder="public")
+            database = c3.text_input("Database / Service name", placeholder="mydb", key="ext_database")
+            schema   = c4.text_input("Schema", placeholder="public", key="ext_schema")
             c5, c6  = st.columns(2)
-            username = c5.text_input("Username")
-            password = c6.text_input("Password", type="password")
+            username = c5.text_input("Username", key="ext_username")
+            password = c6.text_input("Password", type="password", key="ext_password")
             odbc_driver = ""
             if db_type == "sqlserver":
-                odbc_driver = st.text_input("ODBC Driver", value="ODBC Driver 18 for SQL Server")
+                odbc_driver = st.text_input("ODBC Driver", value="ODBC Driver 18 for SQL Server", key="ext_odbc")
             bq_project = bq_dataset = bq_creds = spark_master = http_path = ""
+
+        # ── Schema & table discovery ───────────────────────────────────────────
+        st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:0.8rem 0">', unsafe_allow_html=True)
+        disco_cols = st.columns([2, 1])
+        with disco_cols[0]:
+            st.markdown('<div class="sec-head">🔍 Discover Schemas & Tables</div>', unsafe_allow_html=True)
+        with disco_cols[1]:
+            st.markdown("<br>", unsafe_allow_html=True)
+            disco_btn = st.button("🔍 Discover", key="ext_disco_btn", use_container_width=True)
+
+        ext_disco = st.session_state.ext_disco
+
+        if disco_btn:
+            if needs_bq:
+                disco_payload = {
+                    "db_type": db_type, "project": bq_project or None,
+                    "schema_name": bq_dataset or None, "credentials_path": bq_creds or None,
+                }
+            elif needs_spark:
+                disco_payload = {
+                    "db_type": db_type, "host": host or None,
+                    "database": database or None, "schema_name": schema or None,
+                    "password": password or None, "spark_master": spark_master or None,
+                    "extra": {"http_path": http_path} if http_path else {},
+                }
+            else:
+                _extra: Dict[str, Any] = {}
+                if db_type == "sqlserver" and odbc_driver:
+                    _extra["driver"] = odbc_driver
+                disco_payload = {
+                    "db_type": db_type, "host": host or None, "port": int(port) if port else None,
+                    "database": database or None, "schema_name": schema or None,
+                    "username": username or None, "password": password or None, "extra": _extra,
+                }
+            with st.spinner("Connecting and discovering schemas…"):
+                try:
+                    ext_disco = api.discover(disco_payload)
+                    st.session_state.ext_disco = ext_disco
+                except Exception as e:
+                    st.error(f"Discovery failed: {e}")
+                    ext_disco = None
+
+        # Show discovered schemas and tables
+        schema_sel  = schema   # fallback to typed value
+        target_raw  = ""
+        target_tables_sel: List[str] = []
+
+        if ext_disco and ext_disco.get("schemas"):
+            all_schemas = ext_disco["schemas"]
+            tables_by_schema: Dict[str, List[str]] = ext_disco.get("tables", {})
+
+            st.caption(f"✓ Found {len(all_schemas)} schema(s) — select one to browse its tables")
+            schema_sel = st.selectbox(
+                "Schema / Dataset", all_schemas,
+                index=all_schemas.index(schema) if schema in all_schemas else 0,
+                key="ext_disco_schema",
+            )
+            # Override schema with discovered selection
+            if not needs_bq:
+                schema = schema_sel
+            elif not bq_dataset:
+                bq_dataset = schema_sel
+
+            available_tables = tables_by_schema.get(schema_sel, [])
+            if available_tables:
+                st.caption(f"📋 {len(available_tables)} table(s) in '{schema_sel}'")
+                target_tables_sel = st.multiselect(
+                    "Select tables to extract (leave empty = all)",
+                    available_tables,
+                    key="ext_disco_tables",
+                )
+            else:
+                st.caption(f"No tables found in '{schema_sel}'.")
+
+            if st.button("🔄 Re-discover", key="ext_redisco_btn"):
+                st.session_state.ext_disco = None
+                st.rerun()
+        else:
+            # No discovery data yet — raw text input fallback
+            target_raw = st.text_input(
+                "Target tables (blank = all)", placeholder="users, orders", key="ext_target_raw"
+            )
 
         st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1rem 0">', unsafe_allow_html=True)
         st.markdown('<div class="sec-head">⚙️ Agent Settings</div>', unsafe_allow_html=True)
 
         c7, c8 = st.columns(2)
-        sample_size    = c7.number_input("Sample size (rows)", value=10_000, min_value=100, step=1000)
-        fd_threshold   = c7.slider("FD threshold", 0.80, 1.0, 1.0, 0.01,
-                                    help="1.0 = exact FDs only; lower = approximate")
-        id_threshold   = c8.slider("IND threshold", 0.70, 1.0, 0.95, 0.01)
-        target_raw     = c8.text_input("Target tables (blank = all)", placeholder="users, orders")
+        sample_size  = c7.number_input("Sample size (rows)", value=10_000, min_value=100, step=1000)
+        fd_threshold = c7.slider("FD threshold", 0.80, 1.0, 1.0, 0.01,
+                                  help="1.0 = exact FDs only; lower = approximate")
+        id_threshold = c8.slider("IND threshold", 0.70, 1.0, 0.95, 0.01)
 
         run_btn = st.button("⚡  Run Extraction", type="primary", use_container_width=True,
                             disabled=bool(st.session_state.running_job_id))
@@ -770,10 +858,13 @@ def _extract_view() -> None:
                 "username": username or None, "password": password or None, "extra": extra,
             }
 
-        target_tables = (
-            [t.strip() for t in target_raw.split(",") if t.strip()]
-            if target_raw.strip() else None
-        )
+        # Prefer multiselect discovery result; fall back to raw text input
+        if target_tables_sel:
+            target_tables: Optional[List[str]] = target_tables_sel
+        elif target_raw.strip():
+            target_tables = [t.strip() for t in target_raw.split(",") if t.strip()]
+        else:
+            target_tables = None
         payload = {
             "db_config":     db_cfg_payload,
             "target_tables": target_tables,
@@ -1808,13 +1899,84 @@ def _dialog_view() -> None:
             d_port = c2.number_input("Port", value=defaults.get(db_type, 5432),
                                      step=1, key="d_port")
             c3, c4 = st.columns(2)
-            d_dbname     = c3.text_input("Database", key="d_dbname")
+            d_dbname      = c3.text_input("Database", key="d_dbname")
             d_schema_name = c4.text_input("Schema", value="public", key="d_schema_name")
             c5, c6 = st.columns(2)
             d_user     = c5.text_input("Username", key="d_user")
             d_password = c6.text_input("Password", type="password", key="d_password")
             d_project = d_schema = d_creds = ""
 
+        # ── Schema & table discovery ───────────────────────────────────────────
+        st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:0.8rem 0">', unsafe_allow_html=True)
+        dlg_disco_cols = st.columns([2, 1])
+        with dlg_disco_cols[0]:
+            st.markdown('<div class="sec-head">🔍 Available Schemas & Tables</div>', unsafe_allow_html=True)
+        with dlg_disco_cols[1]:
+            st.markdown("<br>", unsafe_allow_html=True)
+            dlg_disco_btn = st.button("🔍 Discover", key="dlg_disco_btn", use_container_width=True)
+
+        dlg_disco = st.session_state.dlg_disco
+
+        if dlg_disco_btn:
+            if needs_bq:
+                dlg_disco_payload: Dict[str, Any] = {
+                    "db_type": db_type, "project": d_project or None,
+                    "schema_name": d_schema or None, "credentials_path": d_creds or None,
+                }
+            else:
+                dlg_disco_payload = {
+                    "db_type": db_type, "host": d_host or None,
+                    "port": int(d_port) if d_port else None,
+                    "database": d_dbname or None,
+                    "schema_name": d_schema_name or None,
+                    "username": d_user or None, "password": d_password or None,
+                }
+            with st.spinner("Connecting and discovering schemas…"):
+                try:
+                    dlg_disco = api.discover(dlg_disco_payload)
+                    st.session_state.dlg_disco = dlg_disco
+                except Exception as e:
+                    st.error(f"Discovery failed: {e}")
+                    dlg_disco = None
+
+        if dlg_disco and dlg_disco.get("schemas"):
+            dlg_schemas = dlg_disco["schemas"]
+            dlg_tables_map: Dict[str, List[str]] = dlg_disco.get("tables", {})
+
+            # Schema selector — overrides the text input
+            typed_schema = d_schema_name or d_schema or ""
+            dlg_schema_sel = st.selectbox(
+                "Schema / Dataset",
+                dlg_schemas,
+                index=dlg_schemas.index(typed_schema) if typed_schema in dlg_schemas else 0,
+                key="dlg_disco_schema",
+            )
+            # Push selected schema back to the variables used in the payload below
+            if needs_bq:
+                d_schema = dlg_schema_sel
+            else:
+                d_schema_name = dlg_schema_sel
+
+            dlg_avail_tables = dlg_tables_map.get(dlg_schema_sel, [])
+            if dlg_avail_tables:
+                st.caption(f"📋 {len(dlg_avail_tables)} table(s) in '{dlg_schema_sel}' — select to focus the query")
+                dlg_selected_tables = st.multiselect(
+                    "Focus on specific tables (leave empty = all)",
+                    dlg_avail_tables,
+                    key="dlg_disco_tables",
+                )
+            else:
+                dlg_selected_tables = []
+                st.caption(f"No tables found in '{dlg_schema_sel}'.")
+
+            if st.button("🔄 Re-discover", key="dlg_redisco_btn"):
+                st.session_state.dlg_disco = None
+                st.rerun()
+        else:
+            dlg_selected_tables = []
+            st.caption("Click **🔍 Discover** to browse schemas and tables from the connected database.")
+
+        st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:0.8rem 0">', unsafe_allow_html=True)
         c_q, c_r = st.columns(2)
         max_sql = c_q.number_input("Max SQL queries", min_value=1, max_value=20,
                                     value=5, key="d_max_sql")
@@ -1899,12 +2061,19 @@ def _dialog_view() -> None:
             except Exception as e:
                 st.warning(f"Could not load KG graph data: {e}. Proceeding in schema-less mode.")
 
+        # If the user selected specific tables via discovery, append a hint to
+        # the natural query so the LLM knows which tables to focus on.
+        effective_query = natural_query.strip()
+        if dlg_selected_tables:
+            table_hint = ", ".join(dlg_selected_tables)
+            effective_query += f"\n\n[Focus on these tables: {table_hint}]"
+
         if needs_bq:
             db_extra: Dict = {}
             if d_creds:
                 db_extra["credentials_path"] = d_creds
             payload: Dict[str, Any] = {
-                "natural_query": natural_query.strip(),
+                "natural_query": effective_query,
                 "kg_nodes":      kg_nodes,
                 "kg_edges":      kg_edges,
                 "db_type":       db_type,
@@ -1916,7 +2085,7 @@ def _dialog_view() -> None:
             }
         else:
             payload = {
-                "natural_query": natural_query.strip(),
+                "natural_query": effective_query,
                 "kg_nodes":      kg_nodes,
                 "kg_edges":      kg_edges,
                 "db_type":       db_type,

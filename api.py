@@ -199,30 +199,136 @@ def _ask_llm(report: Dict, question: str) -> str:
     return response.content
 
 
+# ── Schema / table discovery helpers ──────────────────────────────────────────
+
+def _list_schemas(connector, db_type: str) -> List[str]:
+    """Return a list of user-visible schema names from the connected database."""
+    try:
+        if db_type in ("postgres", "redshift"):
+            rows = connector.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE schema_name NOT LIKE 'pg_%' "
+                "  AND schema_name NOT IN ('information_schema') "
+                "ORDER BY schema_name"
+            )
+            return [r["schema_name"] for r in rows]
+
+        elif db_type == "oracle":
+            rows = connector.execute(
+                "SELECT DISTINCT owner FROM all_tables ORDER BY owner"
+            )
+            _skip = {"SYS", "SYSTEM", "OUTLN", "DBSNMP", "WMSYS", "XDB", "APEX_030200",
+                     "CTXSYS", "EXFSYS", "MDSYS", "OLAPSYS", "ORDDATA", "ORDSYS",
+                     "ORDPLUGINS", "SI_INFORMTN_SCHEMA"}
+            key = next((k for k in (rows[0] if rows else {}) if k.upper() == "OWNER"), "owner")
+            return [r[key] for r in rows if r.get(key) not in _skip]
+
+        elif db_type == "sqlserver":
+            rows = connector.execute(
+                "SELECT name FROM sys.schemas "
+                "WHERE name NOT IN ('guest','INFORMATION_SCHEMA','sys') "
+                "  AND name NOT LIKE 'db_%' "
+                "ORDER BY name"
+            )
+            return [r["name"] for r in rows]
+
+        elif db_type == "teradata":
+            rows = connector.execute(
+                "SELECT DatabaseName FROM DBC.Databases WHERE DBKind='D' ORDER BY DatabaseName"
+            )
+            return [r.get("DatabaseName") or r.get("databasename", "") for r in rows]
+
+        elif db_type == "bigquery":
+            rows = connector.execute(
+                "SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA ORDER BY schema_name"
+            )
+            return [r.get("schema_name", "") for r in rows]
+
+        elif db_type == "delta_lake":
+            rows = connector.execute("SHOW DATABASES")
+            return [r.get("databaseName") or r.get("namespace", "") for r in rows if r]
+
+        else:
+            return []
+    except Exception as exc:
+        logger.warning("_list_schemas failed for %s: %s", db_type, exc)
+        return []
+
+
+def _build_db_config(db: DBConfigIn) -> DBConfig:
+    return DBConfig(
+        db_type=DBType(db.db_type),
+        host=db.host,
+        port=db.port,
+        database=db.database,
+        schema=db.schema_name,
+        username=db.username,
+        password=db.password,
+        project=db.project,
+        credentials_path=db.credentials_path,
+        spark_master=db.spark_master,
+        catalog=db.catalog,
+        extra=db.extra,
+    )
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+@app.post("/discover")
+def discover_db(db: DBConfigIn):
+    """
+    Connect to the database and return available schemas and their tables.
+
+    If `schema_name` is provided in the request, only tables for that schema
+    are returned.  Otherwise all user-visible schemas are listed and their
+    tables are fetched (capped at 50 schemas to avoid long waits).
+    """
+    try:
+        db_cfg = _build_db_config(db)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid DB config: {e}")
+
+    from connectors.factory import get_connector  # noqa: PLC0415
+    try:
+        conn = get_connector(db_cfg)
+        conn.connect()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not connect: {e}")
+
+    try:
+        if db.schema_name:
+            schemas = [db.schema_name]
+        else:
+            schemas = _list_schemas(conn, db.db_type)
+
+        tables_by_schema: Dict[str, List[str]] = {}
+        for schema in schemas[:50]:
+            try:
+                tbls = conn.list_tables(schema)
+                tables_by_schema[schema] = sorted(t[1] for t in tbls)
+            except Exception:
+                tables_by_schema[schema] = []
+
+        return {"schemas": schemas, "tables": tables_by_schema}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.post("/extract", status_code=202)
 def start_extraction(req: ExtractionRequest, background_tasks: BackgroundTasks):
     db = req.db_config
     try:
-        db_cfg = DBConfig(
-            db_type=DBType(db.db_type),
-            host=db.host,
-            port=db.port,
-            database=db.database,
-            schema=db.schema_name,
-            username=db.username,
-            password=db.password,
-            project=db.project,
-            credentials_path=db.credentials_path,
-            spark_master=db.spark_master,
-            catalog=db.catalog,
-            extra=db.extra,
-        )
+        db_cfg = _build_db_config(db)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid DB config: {e}")
 

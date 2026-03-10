@@ -1283,6 +1283,13 @@ def _ontology_view() -> None:
         except Exception as e:
             st.error(f"Could not load metadata report: {e}")
             return
+        if not report:
+            st.error(
+                "The selected extraction run has an empty report. "
+                "The extraction may have failed or produced no data. "
+                "Please re-run the extraction and try again."
+            )
+            return
         try:
             jid = onto_api.generate({
                 "report":             report,

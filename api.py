@@ -117,13 +117,15 @@ def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: 
     try:
         agent = MetadataExtractionAgent(agent_cfg)
 
+        pipeline_error: Optional[str] = None
         for node_name, _ in agent.stream_run():
             clean = node_name.strip("_").replace("error_end", "error")
 
             with _lock:
                 if "error" in node_name:
+                    pipeline_error = f"Pipeline error at node: {node_name}"
                     _jobs[job_id]["status"] = "error"
-                    _jobs[job_id]["error"]  = f"Pipeline error at node: {node_name}"
+                    _jobs[job_id]["error"]  = pipeline_error
                 else:
                     real = clean if clean in PIPELINE_NODES else None
                     if real and real not in completed:
@@ -131,7 +133,16 @@ def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: 
                     _jobs[job_id]["completed_nodes"] = list(completed)
                     _jobs[job_id]["current_node"]    = clean
 
+        if pipeline_error:
+            return   # job already marked "error" — do not save empty report
+
         report   = agent._report or {}
+        if not report:
+            with _lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"]  = "Pipeline completed but produced an empty report"
+            return
+
         out_path = str(DATA_DIR / f"{db_type}_{job_id[:8]}.json")
         Path(out_path).write_text(json.dumps(report, indent=2, default=str))
 
@@ -169,13 +180,18 @@ def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: 
 
 # ── Helper: load report from disk ──────────────────────────────────────────────
 def _load_report_from_path(path: str) -> Dict:
+    if not path:
+        raise HTTPException(status_code=404, detail="No report path recorded for this run")
     p = Path(path)
     if not p.exists():
         raise HTTPException(status_code=404, detail="Report file not found on disk")
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not parse report: {e}")
+    if not data:
+        raise HTTPException(status_code=404, detail="Report file is empty — extraction may have failed")
+    return data
 
 
 # ── Helper: LLM ask ───────────────────────────────────────────────────────────

@@ -98,6 +98,29 @@ services:
     networks:
       - metadata-net
 
+  # ── Conformity API ────────────────────────────────────────────────────────────
+  conformity-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.conformity
+    image: metadata-conformity-api:latest
+    container_name: metadata-conformity-api
+    restart: unless-stopped
+    ports:
+      - "${CONFORMITY_PORT:-8004}:8004"
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - metadata-net
+
   # ── Streamlit UI ──────────────────────────────────────────────────────────────
   ui:
     build:
@@ -110,10 +133,11 @@ services:
       - "${UI_PORT:-8501}:8501"
     environment:
       # Must match service names above so Docker DNS resolves them
-      AGENT_API_URL:    "http://agent-api:8000"
-      ONTOLOGY_API_URL: "http://ontology-api:8001"
-      KG_API_URL:       "http://kg-api:8002"
-      DIALOG_API_URL:   "http://dialog-api:8003"
+      AGENT_API_URL:       "http://agent-api:8000"
+      ONTOLOGY_API_URL:    "http://ontology-api:8001"
+      KG_API_URL:          "http://kg-api:8002"
+      DIALOG_API_URL:      "http://dialog-api:8003"
+      CONFORMITY_API_URL:  "http://conformity-api:8004"
     depends_on:
       agent-api:
         condition: service_healthy
@@ -122,6 +146,8 @@ services:
       kg-api:
         condition: service_started
       dialog-api:
+        condition: service_started
+      conformity-api:
         condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c",

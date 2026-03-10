@@ -1,0 +1,25 @@
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+COPY requirements.conformity.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.conformity.txt
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy only the conformity agent source
+COPY conformity_agent/ ./conformity_agent/
+COPY conformity_api.py .
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8004
+
+CMD ["python", "-m", "uvicorn", "conformity_api:app", "--host", "0.0.0.0", "--port", "8004"]

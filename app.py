@@ -257,6 +257,66 @@ class DialogAPIClient:
 
 dialog_api = DialogAPIClient(DIALOG_API_URL)
 
+
+# ── Conformity API client ──────────────────────────────────────────────────────
+CONFORMITY_API_URL = os.environ.get("CONFORMITY_API_URL", "http://localhost:8004").rstrip("/")
+
+
+class ConformityAPIClient:
+    def __init__(self, base: str):
+        self._base = base
+
+    def _check(self, r: "requests.Response") -> "requests.Response":
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
+        return r
+
+    def health(self) -> bool:
+        try:
+            return requests.get(f"{self._base}/health", timeout=5).status_code == 200
+        except Exception:
+            return False
+
+    def analyse(self, payload: Dict) -> str:
+        r = self._check(requests.post(f"{self._base}/analyse", json=payload, timeout=120))
+        return r.json()["job_id"]
+
+    def get_job(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}", timeout=30)).json()
+
+    def get_results(self, job_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/jobs/{job_id}/results", timeout=30)).json()
+
+    def stitch(self, payload: Dict) -> str:
+        r = self._check(requests.post(f"{self._base}/stitch", json=payload, timeout=120))
+        return r.json()["stitch_id"]
+
+    def get_stitch(self, stitch_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/stitch/{stitch_id}", timeout=30)).json()
+
+    def get_stitch_graph(self, stitch_id: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/stitch/{stitch_id}/graph", timeout=30)).json()
+
+    def list_super_graphs(self) -> List[Dict]:
+        try:
+            return requests.get(f"{self._base}/super-graphs", timeout=10).json()
+        except Exception:
+            return []
+
+    def save_super_graph(self, payload: Dict) -> Dict:
+        return self._check(requests.post(f"{self._base}/super-graphs", json=payload, timeout=30)).json()
+
+    def get_super_graph(self, name: str) -> Dict:
+        return self._check(requests.get(f"{self._base}/super-graphs/{name}", timeout=30)).json()
+
+
+conformity_api = ConformityAPIClient(CONFORMITY_API_URL)
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_META: Dict[str, Dict] = {
     "postgres":   {"icon": "🐘", "label": "PostgreSQL", "color": "#60a5fa"},
@@ -481,7 +541,15 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("dialog_kg_job_id", None),
                 # Schema/table discovery results
                 ("ext_disco", None),    # {schemas:[...], tables:{schema:[...]}}
-                ("dlg_disco", None)]:
+                ("dlg_disco", None),
+                # Conformity agent state
+                ("conformity_job_id", None),
+                ("conformity_results", None),
+                ("conformity_stitch_id", None),
+                ("conformity_super_graph", None),
+                ("conformity_approved", set()),
+                ("conformity_kg_ids", []),
+                ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -496,7 +564,8 @@ def _sidebar() -> None:
         )
         # API status indicators
         for label, checker in [("Agent API", api.health), ("Ontology API", onto_api.health),
-                                ("KG API", kg_api.health), ("Dialog API", dialog_api.health)]:
+                                ("KG API", kg_api.health), ("Dialog API", dialog_api.health),
+                                ("Conformity API", conformity_api.health)]:
             ok  = checker()
             dot = "🟢" if ok else "🔴"
             st.markdown(
@@ -506,12 +575,13 @@ def _sidebar() -> None:
             )
         st.markdown("---")
 
-        for key, icon, label in [("extract",  "⚡",  "New Extraction"),
-                                   ("history",  "🗂️",  "History"),
-                                   ("search",   "🔍", "Search Metadata"),
-                                   ("ontology", "🦉", "Ontology Generator"),
-                                   ("kg",       "🕸️", "Knowledge Graph"),
-                                   ("dialog",   "💬", "Dialog with Data")]:
+        for key, icon, label in [("extract",    "⚡",  "New Extraction"),
+                                   ("history",    "🗂️",  "History"),
+                                   ("search",     "🔍", "Search Metadata"),
+                                   ("ontology",   "🦉", "Ontology Generator"),
+                                   ("kg",         "🕸️", "Knowledge Graph"),
+                                   ("dialog",     "💬", "Dialog with Data"),
+                                   ("conformity", "🔗", "KG Conformity")]:
             active = st.session_state.page == key
             if st.button(
                 f"{icon}  {label}",
@@ -2268,6 +2338,346 @@ def _dialog_view() -> None:
                 st.markdown(f"- {err}")
 
 
+# ── Conformity view ────────────────────────────────────────────────────────────
+def _conformity_view() -> None:
+    import json as _json
+
+    st.markdown(
+        '<div class="hero">'
+        '<div class="hero-title">🔗 KG Conformity</div>'
+        '<div class="hero-sub">Detect conformed nodes across knowledge graphs and stitch them into a super-graph</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Step 1: Select KGs ─────────────────────────────────────────────────────
+    st.markdown('<div class="sec-head">1️⃣ Select Knowledge Graphs to Compare</div>', unsafe_allow_html=True)
+
+    done_jobs = [j for j in kg_api.list_jobs() if j.get("status") == "done"]
+    if not done_jobs:
+        st.info("No completed Knowledge Graph jobs found. Generate at least two KGs first.")
+        return
+
+    kg_options = {f"KG {j['id'][:8]}… ({j.get('node_count',0)} nodes, {j.get('edge_count',0)} edges)": j["id"]
+                  for j in done_jobs}
+    selected_labels = st.multiselect(
+        "Choose 2 or more KGs:",
+        options=list(kg_options.keys()),
+        default=list(kg_options.keys())[:min(2, len(kg_options))],
+        key="conformity_kg_select",
+    )
+    selected_job_ids = [kg_options[lbl] for lbl in selected_labels]
+
+    # ── Analyse ────────────────────────────────────────────────────────────────
+    col_left, col_right = st.columns([2, 1])
+    with col_left:
+        fuzzy_thresh   = st.slider("Fuzzy label threshold", 50, 100, 80, key="conf_fuzzy")
+        jaccard_thresh = st.slider("Property Jaccard threshold", 0.0, 1.0, 0.30, step=0.05, key="conf_jaccard")
+    with col_right:
+        st.markdown("<br>", unsafe_allow_html=True)
+        analyse_btn = st.button(
+            "🔍 Analyse Conformities",
+            disabled=len(selected_job_ids) < 2,
+            use_container_width=True,
+        )
+
+    if analyse_btn and len(selected_job_ids) >= 2:
+        # Build snapshots
+        snapshots = []
+        for jid in selected_job_ids:
+            try:
+                gd = kg_api.get_graph(jid)
+                snapshots.append({"kg_id": jid[:8], "nodes": gd.get("nodes", []), "edges": gd.get("edges", [])})
+            except Exception as e:
+                st.error(f"Could not load graph for job {jid[:8]}: {e}")
+                return
+        try:
+            job_id = conformity_api.analyse({
+                "kg_snapshots":    snapshots,
+                "fuzzy_threshold": fuzzy_thresh,
+                "jaccard_threshold": jaccard_thresh,
+            })
+            st.session_state.conformity_job_id    = job_id
+            st.session_state.conformity_results   = None
+            st.session_state.conformity_stitch_id = None
+            st.session_state.conformity_super_graph = None
+            st.session_state.conformity_approved  = set()
+            st.session_state.conformity_kg_ids    = [s["kg_id"] for s in snapshots]
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to start analysis: {e}")
+
+    # ── Poll analyse job ───────────────────────────────────────────────────────
+    job_id = st.session_state.conformity_job_id
+    if job_id and not st.session_state.conformity_results:
+        status = {}
+        try:
+            status = conformity_api.get_job(job_id)
+        except Exception as e:
+            st.error(f"Could not poll job: {e}")
+
+        if status.get("status") == "running":
+            with st.spinner("Analysing conformities…"):
+                time.sleep(2)
+                st.rerun()
+        elif status.get("status") == "completed":
+            try:
+                results = conformity_api.get_results(job_id)
+                st.session_state.conformity_results = results
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not fetch results: {e}")
+        elif status.get("status") == "error":
+            st.error(f"Analysis failed: {status.get('errors', [])}")
+            st.session_state.conformity_job_id = None
+
+    # ── Show results ───────────────────────────────────────────────────────────
+    results = st.session_state.conformity_results
+    if not results:
+        return
+
+    conformities = results.get("conformities", [])
+    exact_c   = results.get("exact_count", 0)
+    fuzzy_c   = results.get("fuzzy_count", 0)
+    jaccard_c = results.get("jaccard_count", 0)
+
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="sec-head">2️⃣ Conformity Analysis Results</div>', unsafe_allow_html=True)
+
+    # Stats row
+    stat_cards = [
+        _stat_card(len(conformities), "Total Candidates", "#63b3ed"),
+        _stat_card(exact_c,   "Exact Matches",    "#68d391"),
+        _stat_card(fuzzy_c,   "Fuzzy Matches",    "#f6ad55"),
+        _stat_card(jaccard_c, "Property Matches", "#b794f4"),
+    ]
+    st.markdown('<div class="stat-row">' + "".join(stat_cards) + "</div>", unsafe_allow_html=True)
+
+    # Recommendations
+    recs = results.get("recommendations", "")
+    if recs:
+        with st.expander("📋 AI Recommendations", expanded=True):
+            st.markdown(recs)
+
+    if not conformities:
+        st.info("No conformity candidates found — graphs appear to have entirely distinct schemas.")
+        return
+
+    # ── Step 2: Approve conformities ──────────────────────────────────────────
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="sec-head">3️⃣ Approve Conformities to Stitch</div>', unsafe_allow_html=True)
+    st.caption("Check the conformities you want to merge, then click **Approve & Stitch**.")
+
+    approved: set = st.session_state.conformity_approved
+
+    # Select/deselect all
+    sel_col1, sel_col2 = st.columns(2)
+    with sel_col1:
+        if st.button("✅ Select All", use_container_width=True):
+            st.session_state.conformity_approved = {c["index"] for c in conformities}
+            st.rerun()
+    with sel_col2:
+        if st.button("⬜ Deselect All", use_container_width=True):
+            st.session_state.conformity_approved = set()
+            st.rerun()
+
+    type_colors = {"exact": "#68d391", "fuzzy": "#f6ad55", "property_jaccard": "#b794f4"}
+
+    for c in conformities:
+        idx   = c["index"]
+        mtype = c.get("match_type", "")
+        color = type_colors.get(mtype, "#94a3b8")
+        checked = idx in approved
+        new_checked = st.checkbox(
+            f"#{idx} | **{c['node_a_label']}** ({c['kg_a_id']}) ↔ **{c['node_b_label']}** ({c['kg_b_id']}) "
+            f"| {mtype} | score={c['score']:.2f} | jaccard={c['jaccard']:.2f}",
+            value=checked,
+            key=f"conf_check_{idx}",
+        )
+        if new_checked != checked:
+            new_set = set(approved)
+            if new_checked:
+                new_set.add(idx)
+            else:
+                new_set.discard(idx)
+            st.session_state.conformity_approved = new_set
+            approved = new_set
+
+    # ── Stitch button ──────────────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    stitch_btn = st.button(
+        f"🔗 Approve & Stitch ({len(approved)} selected)",
+        disabled=(len(approved) == 0),
+        use_container_width=True,
+        type="primary",
+    )
+
+    if stitch_btn and approved:
+        try:
+            stitch_id = conformity_api.stitch({
+                "job_id":           job_id,
+                "approved_indices": list(approved),
+            })
+            st.session_state.conformity_stitch_id  = stitch_id
+            st.session_state.conformity_super_graph = None
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to start stitch: {e}")
+
+    # ── Poll stitch job ────────────────────────────────────────────────────────
+    stitch_id = st.session_state.conformity_stitch_id
+    if stitch_id and not st.session_state.conformity_super_graph:
+        try:
+            st_status = conformity_api.get_stitch(stitch_id)
+        except Exception as e:
+            st.error(f"Could not poll stitch job: {e}")
+            st_status = {}
+
+        if st_status.get("status") == "running":
+            with st.spinner("Stitching super-graph…"):
+                time.sleep(2)
+                st.rerun()
+        elif st_status.get("status") == "completed":
+            try:
+                sg = conformity_api.get_stitch_graph(stitch_id)
+                st.session_state.conformity_super_graph = sg
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not fetch super-graph: {e}")
+        elif st_status.get("status") == "error":
+            st.error(f"Stitch failed: {st_status.get('errors', [])}")
+
+    # ── Show super-graph ───────────────────────────────────────────────────────
+    sg = st.session_state.conformity_super_graph
+    if not sg:
+        return
+
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="sec-head">4️⃣ Super Knowledge Graph</div>', unsafe_allow_html=True)
+
+    sg_nodes = sg.get("nodes", [])
+    sg_edges = sg.get("edges", [])
+    stat_cards2 = [
+        _stat_card(len(sg_nodes), "Nodes",  "#63b3ed"),
+        _stat_card(len(sg_edges), "Edges",  "#68d391"),
+        _stat_card(len(approved), "Merged", "#f6ad55"),
+    ]
+    st.markdown('<div class="stat-row">' + "".join(stat_cards2) + "</div>", unsafe_allow_html=True)
+
+    # Stitch log
+    stitch_log = []
+    try:
+        stitch_log = conformity_api.get_stitch(stitch_id).get("stitch_log", [])
+    except Exception:
+        pass
+    if stitch_log:
+        with st.expander("🪢 Stitch log", expanded=False):
+            for line in stitch_log:
+                st.markdown(f"- {line}")
+
+    # Visualise super-graph using pyvis
+    try:
+        from pyvis.network import Network as _Network  # noqa: PLC0415
+        import tempfile, os as _os  # noqa: PLC0415
+
+        net = _Network(height="600px", width="100%", bgcolor="#0d1b2a", font_color="#e2e8f0")
+        net.set_options("""{
+          "nodes": {"borderWidth": 2, "shadow": true},
+          "edges": {"smooth": {"type": "dynamic"}, "shadow": true},
+          "physics": {"stabilization": {"iterations": 120}}
+        }""")
+        for node in sg_nodes:
+            color = node.get("color", "#63b3ed")
+            if isinstance(color, dict):
+                color = color.get("color", "#63b3ed")
+            net.add_node(
+                node["id"],
+                label=node.get("label", node["id"]),
+                title=node.get("title", ""),
+                color=color,
+                size=node.get("size", 20),
+            )
+        for edge in sg_edges:
+            ec = edge.get("color", {})
+            if isinstance(ec, dict):
+                ec = ec.get("color", "#68d391")
+            net.add_edge(
+                edge.get("from", ""),
+                edge.get("to", ""),
+                label=edge.get("label", ""),
+                title=edge.get("title", ""),
+                color=ec,
+            )
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            net.save_graph(f.name)
+            html_content = open(f.name).read()
+        st.components.v1.html(html_content, height=620, scrolling=False)
+    except ImportError:
+        st.warning("pyvis not installed — cannot render graph. Install with: pip install pyvis")
+    except Exception as e:
+        st.error(f"Graph render error: {e}")
+
+    # ── Download super-graph JSON ──────────────────────────────────────────────
+    st.download_button(
+        "⬇ Download super-graph JSON",
+        data=_json.dumps(sg, indent=2, default=str),
+        file_name="super_graph.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    # ── Save super-graph ───────────────────────────────────────────────────────
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.06);margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="sec-head">5️⃣ Save Super Knowledge Graph</div>', unsafe_allow_html=True)
+    sg_name = st.text_input("Name for this super-graph:", value="super_kg_1", key="sg_save_name")
+    if st.button("💾 Save Super-Graph", use_container_width=True, disabled=not sg_name.strip()):
+        try:
+            saved = conformity_api.save_super_graph({
+                "stitch_id": stitch_id,
+                "name":      sg_name.strip(),
+            })
+            st.success(f"Saved '{saved['name']}' ({saved['node_count']} nodes, {saved['edge_count']} edges)")
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+    # ── List saved super-graphs ────────────────────────────────────────────────
+    saved_sgs = conformity_api.list_super_graphs()
+    if saved_sgs:
+        with st.expander("📚 Saved Super-Graphs", expanded=False):
+            for sg_rec in saved_sgs:
+                c1, c2 = st.columns([6, 2])
+                with c1:
+                    st.markdown(
+                        f'<div class="hcard-title">{sg_rec["name"]}</div>'
+                        f'<div class="hcard-meta">{sg_rec["node_count"]} nodes · {sg_rec["edge_count"]} edges</div>',
+                        unsafe_allow_html=True,
+                    )
+                with c2:
+                    if st.button("⬇ Download", key=f"dl_sg_{sg_rec['name']}"):
+                        try:
+                            dl_sg = conformity_api.get_super_graph(sg_rec["name"])
+                            st.download_button(
+                                "Download JSON",
+                                data=_json.dumps(dl_sg, indent=2, default=str),
+                                file_name=f"{sg_rec['name']}.json",
+                                mime="application/json",
+                            )
+                        except Exception as e:
+                            st.error(f"Download failed: {e}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     _inject_css()
@@ -2285,6 +2695,8 @@ def main() -> None:
         _kg_view()
     elif page == "dialog":
         _dialog_view()
+    elif page == "conformity":
+        _conformity_view()
 
 
 if __name__ == "__main__":

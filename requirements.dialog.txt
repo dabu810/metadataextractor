@@ -6,6 +6,10 @@ anthropic>=0.28.0
 langgraph>=0.1.0
 langchain-core>=0.2.0
 
+# File-based sources (CSV / Excel) — sqlite3 is stdlib
+pandas>=2.0.0
+openpyxl>=3.1.0
+
 # Database drivers (optional — only the target DB driver is needed at runtime)
 psycopg2-binary>=2.9.9        # PostgreSQL / Redshift
 # cx_Oracle>=8.3.0            # Oracle (install manually if needed)

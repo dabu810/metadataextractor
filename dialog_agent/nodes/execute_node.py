@@ -122,30 +122,59 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
 
 
 def _run_file_based(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
-    """Run SQL against a file-based source (SQLite / CSV / Excel) via the shared connectors."""
-    import sys
+    """Run SQL against a SQLite / CSV / Excel source using sqlite3 + pandas directly."""
+    import re
+    import sqlite3
     from pathlib import Path
-    # Ensure the metadata_agent package is importable from inside the dialog agent
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-    from metadata_agent.config import DBConfig, DBType
-    from metadata_agent.connectors import get_connector
 
-    _type_map = {"sqlite": DBType.SQLITE, "csv": DBType.CSV, "excel": DBType.EXCEL}
-    db_cfg = DBConfig(
-        db_type=_type_map[cfg.db_type.lower()],
-        file_path=cfg.db_file_path,
-    )
-    conn = get_connector(db_cfg)
-    conn.connect()
+    db      = cfg.db_type.lower()
+    fpath   = cfg.db_file_path
+
+    def _safe(name: str) -> str:
+        s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+        return ("sheet_" + s if s and s[0].isdigit() else s) or "sheet"
+
+    if db == "sqlite":
+        sqlite_conn = sqlite3.connect(fpath, check_same_thread=False)
+    else:
+        import pandas as pd
+        sqlite_conn = sqlite3.connect(":memory:", check_same_thread=False)
+        if db == "csv":
+            dir_path = Path(fpath)
+            for f in sorted(dir_path.glob("*.csv")):
+                try:
+                    df = pd.read_csv(f)
+                    df.columns = [c.replace(" ", "_").replace("-", "_") for c in df.columns]
+                    df.to_sql(f.stem, sqlite_conn, if_exists="replace", index=False)
+                except Exception:
+                    pass
+        else:  # excel
+            xl = pd.ExcelFile(fpath)
+            used: dict = {}
+            for sheet in xl.sheet_names:
+                base = _safe(sheet)
+                if base in used:
+                    used[base] += 1
+                    safe = f"{base}_{used[base]}"
+                else:
+                    used[base] = 1
+                    safe = base
+                try:
+                    df = xl.parse(sheet)
+                    df.columns = [_safe(c) for c in df.columns]
+                    df.to_sql(safe, sqlite_conn, if_exists="replace", index=False)
+                except Exception:
+                    pass
+
+    sqlite_conn.row_factory = sqlite3.Row
     try:
-        rows_dicts = conn.execute(sql)
-        if not rows_dicts:
-            return {"columns": [], "rows": [], "error": None}
-        columns = list(rows_dicts[0].keys())
-        rows = [[r[c] for c in columns] for r in rows_dicts]
-        return {"columns": columns, "rows": rows, "error": None}
+        cur = sqlite_conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = [list(r) for r in (cur.fetchall() or [])]
+        return {"columns": cols, "rows": rows, "error": None}
     finally:
-        conn.close()
+        sqlite_conn.close()
 
 
 def _run_bigquery(cfg: DialogConfig, sql: str) -> Dict[str, Any]:

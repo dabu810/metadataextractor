@@ -29,14 +29,21 @@ class SQLServerConnector(BaseConnector):
                 )
                 self._conn = pyodbc.connect(cs)
         except ImportError:
-            import pymssql
-            self._conn = pymssql.connect(
-                server=self._config.host,
-                port=self._config.port or 1433,
-                database=self._config.database,
-                user=self._config.username,
-                password=self._config.password,
-            )
+            try:
+                import pymssql
+                self._conn = pymssql.connect(
+                    server=self._config.host,
+                    port=self._config.port or 1433,
+                    database=self._config.database,
+                    user=self._config.username,
+                    password=self._config.password,
+                )
+            except ImportError:
+                raise ImportError(
+                    "No SQL Server driver found. "
+                    "Install pyodbc (recommended): pip install pyodbc  "
+                    "or pymssql: pip install pymssql"
+                )
 
     def close(self) -> None:
         if self._conn:

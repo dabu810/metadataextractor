@@ -20,7 +20,7 @@ psycopg2-binary>=2.9.0
 # oracledb>=2.0.0
 
 # SQL Server
-# pyodbc>=5.0.0
+pyodbc>=5.0.0
 
 # Teradata
 # teradatasql>=20.0.0

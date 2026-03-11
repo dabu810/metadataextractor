@@ -46,26 +46,44 @@ class ExcelConnector(BaseConnector):
         self._conn.row_factory = sqlite3.Row
         self._sheets = []
 
-        used: dict = {}
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        used_sheets: dict = {}
         for sheet in xl.sheet_names:
             base = _safe_name(sheet)
-            # Deduplicate: if two sheets produce the same safe name, append _2, _3 …
-            if base in used:
-                used[base] += 1
-                safe = f"{base}_{used[base]}"
+            # Deduplicate sheet→table names
+            if base in used_sheets:
+                used_sheets[base] += 1
+                safe = f"{base}_{used_sheets[base]}"
             else:
-                used[base] = 1
+                used_sheets[base] = 1
                 safe = base
             try:
                 df = xl.parse(sheet)
-                # Sanitise column names
-                df.columns = [_safe_name(str(c)) for c in df.columns]
+
+                # Deduplicate column names after sanitisation
+                # (two columns that map to the same safe name crash df.to_sql)
+                used_cols: dict = {}
+                new_cols = []
+                for c in df.columns:
+                    sc = _safe_name(str(c))
+                    if sc in used_cols:
+                        used_cols[sc] += 1
+                        sc = f"{sc}_{used_cols[sc]}"
+                    else:
+                        used_cols[sc] = 1
+                    new_cols.append(sc)
+                df.columns = new_cols
+
                 df.to_sql(safe, self._conn, if_exists="replace", index=False)
                 self._sheets.append(safe)
+                _log.info("ExcelConnector: loaded sheet %r → table %r (%d rows, %d cols)",
+                          sheet, safe, len(df), len(df.columns))
             except Exception as exc:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "ExcelConnector: skipping sheet %r — %s", sheet, exc
+                _log.warning(
+                    "ExcelConnector: skipping sheet %r (→ %r) — %s: %s",
+                    sheet, safe, type(exc).__name__, exc
                 )
 
     def close(self) -> None:

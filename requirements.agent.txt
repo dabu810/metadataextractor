@@ -12,6 +12,10 @@ langchain-anthropic>=0.3.0
 langgraph>=0.2.0
 pydantic>=2.0.0
 
+# File-based sources (CSV, Excel) — pandas + openpyxl always included; sqlite3 is stdlib
+pandas>=2.0.0
+openpyxl>=3.1.0
+
 # Database connectors — comment out any you don't need to reduce image size
 # PostgreSQL
 psycopg2-binary>=2.9.0

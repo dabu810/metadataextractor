@@ -326,7 +326,12 @@ DB_META: Dict[str, Dict] = {
     "redshift":   {"icon": "🔺",  "label": "Redshift",   "color": "#a78bfa"},
     "bigquery":   {"icon": "📈",  "label": "BigQuery",   "color": "#f472b6"},
     "delta_lake": {"icon": "⬡",   "label": "Delta Lake", "color": "#2dd4bf"},
+    "sqlite":     {"icon": "🗄️",  "label": "SQLite",     "color": "#94a3b8"},
+    "csv":        {"icon": "📄",  "label": "CSV Files",  "color": "#4ade80"},
+    "excel":      {"icon": "📊",  "label": "Excel",      "color": "#22d3ee"},
 }
+
+_FILE_BASED = {"sqlite", "csv", "excel"}
 
 PIPELINE_NODES = [
     ("connection",  "🔌", "Connecting to database"),
@@ -706,14 +711,27 @@ def _extract_view() -> None:
 
         needs_bq    = db_type == "bigquery"
         needs_spark = db_type == "delta_lake"
+        needs_file  = db_type in _FILE_BASED
 
-        if needs_bq:
+        if needs_file:
+            if db_type == "csv":
+                file_path = st.text_input("CSV directory path", placeholder="/data/csvfiles/", key="ext_file_path")
+                st.caption("Mount your CSV directory into the agent container and enter its path here.")
+            elif db_type == "sqlite":
+                file_path = st.text_input("SQLite file path", placeholder="/data/mydb.sqlite", key="ext_file_path")
+                st.caption("Mount your SQLite file into the agent container and enter its path here.")
+            else:  # excel
+                file_path = st.text_input("Excel file path (.xlsx / .xls)", placeholder="/data/report.xlsx", key="ext_file_path")
+                st.caption("Mount your Excel file into the agent container and enter its path here.")
+            host = port = database = schema = username = password = ""
+            bq_project = bq_dataset = bq_creds = spark_master = http_path = odbc_driver = ""
+        elif needs_bq:
             c1, c2 = st.columns(2)
             bq_project = c1.text_input("GCP Project", placeholder="my-gcp-project", key="ext_bq_project")
             bq_dataset = c2.text_input("Dataset (schema)", placeholder="my_dataset", key="ext_bq_dataset")
             bq_creds   = st.text_input("Service account JSON path", placeholder="/path/to/sa.json", key="ext_bq_creds")
             host = port = database = schema = username = password = ""
-            spark_master = http_path = odbc_driver = ""
+            spark_master = http_path = odbc_driver = file_path = ""
         elif needs_spark:
             c1, c2 = st.columns(2)
             host         = c1.text_input("Databricks host", placeholder="adb-xxx.azuredatabricks.net", key="ext_spark_host")
@@ -724,7 +742,7 @@ def _extract_view() -> None:
             password     = st.text_input("Databricks token", type="password", key="ext_spark_token")
             port         = 443
             username     = ""
-            bq_project = bq_dataset = bq_creds = odbc_driver = ""
+            bq_project = bq_dataset = bq_creds = odbc_driver = file_path = ""
         else:
             c1, c2 = st.columns([3, 1])
             host = c1.text_input("Host", placeholder="localhost", key="ext_host")
@@ -740,7 +758,7 @@ def _extract_view() -> None:
             odbc_driver = ""
             if db_type == "sqlserver":
                 odbc_driver = st.text_input("ODBC Driver", value="ODBC Driver 18 for SQL Server", key="ext_odbc")
-            bq_project = bq_dataset = bq_creds = spark_master = http_path = ""
+            bq_project = bq_dataset = bq_creds = spark_master = http_path = file_path = ""
 
         # ── Schema & table discovery ───────────────────────────────────────────
         st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:0.8rem 0">', unsafe_allow_html=True)
@@ -754,7 +772,11 @@ def _extract_view() -> None:
         ext_disco = st.session_state.ext_disco
 
         if disco_btn:
-            if needs_bq:
+            if needs_file:
+                disco_payload = {
+                    "db_type": db_type, "file_path": file_path or None,
+                }
+            elif needs_bq:
                 disco_payload = {
                     "db_type": db_type, "project": bq_project or None,
                     "schema_name": bq_dataset or None, "credentials_path": bq_creds or None,
@@ -904,8 +926,12 @@ def _extract_view() -> None:
             st.error(f"Cannot reach the Agent API at {AGENT_API_URL}. Is the agent-api container running?")
             return
 
-        if needs_bq:
+        if needs_file:
             db_cfg_payload: Dict[str, Any] = {
+                "db_type": db_type, "file_path": file_path or None,
+            }
+        elif needs_bq:
+            db_cfg_payload = {
                 "db_type": db_type, "project": bq_project or None,
                 "schema_name": bq_dataset or None, "credentials_path": bq_creds or None,
             }

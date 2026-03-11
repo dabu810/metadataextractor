@@ -16,6 +16,9 @@ class DBType(str, Enum):
     REDSHIFT   = "redshift"
     SQLSERVER  = "sqlserver"
     BIGQUERY   = "bigquery"
+    SQLITE     = "sqlite"
+    CSV        = "csv"
+    EXCEL      = "excel"
 
 
 @dataclass
@@ -35,6 +38,8 @@ class DBConfig:
     spark_master: Optional[str] = None    # e.g. "local[*]"
     # Connection string override (optional – takes priority)
     connection_string: Optional[str] = None
+    # File-based sources (SQLite, CSV directory, Excel)
+    file_path: Optional[str] = None
 
 
 @dataclass

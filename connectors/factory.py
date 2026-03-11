@@ -36,4 +36,16 @@ def get_connector(config: DBConfig) -> BaseConnector:
         from .bigquery import BigQueryConnector
         return BigQueryConnector(config)
 
+    if db_type == DBType.SQLITE:
+        from .sqlite import SQLiteConnector
+        return SQLiteConnector(config)
+
+    if db_type == DBType.CSV:
+        from .csv_connector import CSVConnector
+        return CSVConnector(config)
+
+    if db_type == DBType.EXCEL:
+        from .excel_connector import ExcelConnector
+        return ExcelConnector(config)
+
     raise ValueError(f"Unsupported DB type: {db_type}")

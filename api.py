@@ -94,6 +94,7 @@ class DBConfigIn(BaseModel):
     spark_master: Optional[str] = None
     catalog: Optional[str] = None
     extra: Dict[str, Any] = {}
+    file_path: Optional[str] = None
 
 
 class ExtractionRequest(BaseModel):
@@ -264,6 +265,14 @@ def _list_schemas(connector, db_type: str) -> List[str]:
             rows = connector.execute("SHOW DATABASES")
             return [r.get("databaseName") or r.get("namespace", "") for r in rows if r]
 
+        elif db_type == "sqlite":
+            # SQLite has a single implicit schema called "main"
+            return ["main"]
+
+        elif db_type in ("csv", "excel"):
+            # Tables are the CSV files / Excel sheets; single unnamed schema
+            return [""]
+
         else:
             return []
     except Exception as exc:
@@ -285,6 +294,7 @@ def _build_db_config(db: DBConfigIn) -> DBConfig:
         spark_master=db.spark_master,
         catalog=db.catalog,
         extra=db.extra,
+        file_path=db.file_path,
     )
 
 

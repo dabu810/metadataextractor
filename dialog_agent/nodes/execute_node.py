@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def _run_sql(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     """
     Execute *sql* and return {columns, rows, error}.
-    Supports postgres/redshift, oracle, sqlserver, bigquery.
+    Supports postgres/redshift, oracle, sqlserver, bigquery, sqlite, csv, excel.
     Falls back to a generic error for unsupported types.
     """
     db = cfg.db_type.lower()
@@ -35,6 +35,8 @@ def _run_sql(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             return _run_sqlserver(cfg, sql)
         elif db == "bigquery":
             return _run_bigquery(cfg, sql)
+        elif db in ("sqlite", "csv", "excel"):
+            return _run_file_based(cfg, sql)
         else:
             return {"columns": [], "rows": [], "error": f"Unsupported db_type: {db}"}
     except Exception as exc:
@@ -115,6 +117,33 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
                 cur.execute(f"SET SCHEMA [{cfg.db_schema}]")
             cur.execute(sql)
             return _cursor_to_result(cur)
+    finally:
+        conn.close()
+
+
+def _run_file_based(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
+    """Run SQL against a file-based source (SQLite / CSV / Excel) via the shared connectors."""
+    import sys
+    from pathlib import Path
+    # Ensure the metadata_agent package is importable from inside the dialog agent
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    from metadata_agent.config import DBConfig, DBType
+    from metadata_agent.connectors import get_connector
+
+    _type_map = {"sqlite": DBType.SQLITE, "csv": DBType.CSV, "excel": DBType.EXCEL}
+    db_cfg = DBConfig(
+        db_type=_type_map[cfg.db_type.lower()],
+        file_path=cfg.db_file_path,
+    )
+    conn = get_connector(db_cfg)
+    conn.connect()
+    try:
+        rows_dicts = conn.execute(sql)
+        if not rows_dicts:
+            return {"columns": [], "rows": [], "error": None}
+        columns = list(rows_dicts[0].keys())
+        rows = [[r[c] for c in columns] for r in rows_dicts]
+        return {"columns": columns, "rows": rows, "error": None}
     finally:
         conn.close()
 

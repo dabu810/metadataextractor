@@ -10,7 +10,7 @@ from typing import Dict, Any
 @dataclass
 class DialogConfig:
     # ── Target database (SQL execution) ───────────────────────────────────────
-    db_type: str = "postgres"          # "postgres" | "oracle" | "sqlserver" | etc.
+    db_type: str = "postgres"          # "postgres" | "oracle" | "sqlserver" | "sqlite" | "csv" | "excel"
     db_host: str = ""
     db_port: int = 5432
     db_name: str = ""
@@ -19,6 +19,7 @@ class DialogConfig:
     db_password: str = ""
     db_connection_string: str = ""     # overrides individual fields when set
     db_extra: Dict[str, Any] = field(default_factory=dict)
+    db_file_path: str = ""             # for SQLite / CSV / Excel sources
 
     # ── LLM settings ──────────────────────────────────────────────────────────
     llm_model: str = "claude-sonnet-4-6"

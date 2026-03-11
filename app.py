@@ -576,7 +576,8 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("dialog_kg_job_id", None),
                 # Schema/table discovery results
                 ("ext_disco", None),    # {schemas:[...], tables:{schema:[...]}}
-                ("ext_uploaded_path", None),  # server-side path after file upload
+                ("ext_uploaded_path", None),  # server-side path after file upload (extraction)
+                ("dlg_uploaded_path", None),  # server-side path after file upload (dialog)
                 ("dlg_disco", None),
                 # Conformity agent state
                 ("conformity_job_id", None),
@@ -2053,14 +2054,58 @@ def _dialog_view() -> None:
             key="dialog_db_type",
         )
 
-        needs_bq = db_type == "bigquery"
+        needs_bq   = db_type == "bigquery"
+        needs_dfile = db_type in _FILE_BASED
 
-        if needs_bq:
+        if needs_dfile:
+            # Show the previously uploaded file path (from Extraction view) if available
+            prev_path = st.session_state.get("ext_uploaded_path") or ""
+            if prev_path:
+                st.caption(f"Previously uploaded: `{prev_path}`")
+                use_prev = st.checkbox("Reuse this file", value=True, key="dlg_reuse_upload")
+            else:
+                use_prev = False
+
+            if not use_prev:
+                if db_type == "csv":
+                    dlg_uploaded = st.file_uploader(
+                        "Upload CSV file(s)", type=["csv"], accept_multiple_files=True, key="dlg_file_upload"
+                    )
+                elif db_type == "sqlite":
+                    dlg_uploaded = st.file_uploader(
+                        "Upload SQLite database", type=["sqlite", "db", "sqlite3"], key="dlg_file_upload"
+                    )
+                else:
+                    dlg_uploaded = st.file_uploader(
+                        "Upload Excel file", type=["xlsx", "xls", "xlsm", "xlsb"], key="dlg_file_upload"
+                    )
+                if st.button("⬆ Upload file", key="dlg_upload_btn",
+                             disabled=not bool(dlg_uploaded)):
+                    try:
+                        with st.spinner("Uploading…"):
+                            if db_type == "csv":
+                                sp = api.upload_files(dlg_uploaded)
+                            else:
+                                sp = api.upload_file(dlg_uploaded.read(), dlg_uploaded.name)
+                        st.session_state.dlg_uploaded_path = sp
+                        st.success(f"Uploaded → `{sp}`")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
+                        st.session_state.dlg_uploaded_path = None
+
+            d_file_path = (prev_path if use_prev
+                           else st.session_state.get("dlg_uploaded_path") or "")
+            if d_file_path:
+                st.caption(f"Server path: `{d_file_path}`")
+            d_host = d_port = d_dbname = d_user = d_password = d_schema_name = ""
+            d_project = d_schema = d_creds = ""
+        elif needs_bq:
             c1, c2 = st.columns(2)
             d_project = c1.text_input("GCP Project", key="d_project")
             d_schema  = c2.text_input("Dataset", key="d_schema")
             d_creds   = st.text_input("Service account JSON path", key="d_creds")
             d_host = d_port = d_dbname = d_user = d_password = d_schema_name = ""
+            d_file_path = ""
         else:
             c1, c2 = st.columns([3, 1])
             d_host = c1.text_input("Host", placeholder="localhost", key="d_host")
@@ -2074,7 +2119,7 @@ def _dialog_view() -> None:
             c5, c6 = st.columns(2)
             d_user     = c5.text_input("Username", key="d_user")
             d_password = c6.text_input("Password", type="password", key="d_password")
-            d_project = d_schema = d_creds = ""
+            d_project = d_schema = d_creds = d_file_path = ""
 
         # ── Schema & table discovery ───────────────────────────────────────────
         st.markdown('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.06);margin:0.8rem 0">', unsafe_allow_html=True)
@@ -2088,8 +2133,12 @@ def _dialog_view() -> None:
         dlg_disco = st.session_state.dlg_disco
 
         if dlg_disco_btn:
-            if needs_bq:
+            if needs_dfile:
                 dlg_disco_payload: Dict[str, Any] = {
+                    "db_type": db_type, "file_path": d_file_path or None,
+                }
+            elif needs_bq:
+                dlg_disco_payload = {
                     "db_type": db_type, "project": d_project or None,
                     "schema_name": d_schema or None, "credentials_path": d_creds or None,
                 }
@@ -2238,11 +2287,21 @@ def _dialog_view() -> None:
             table_hint = ", ".join(dlg_selected_tables)
             effective_query += f"\n\n[Focus on these tables: {table_hint}]"
 
-        if needs_bq:
+        if needs_dfile:
+            payload: Dict[str, Any] = {
+                "natural_query": effective_query,
+                "kg_nodes":      kg_nodes,
+                "kg_edges":      kg_edges,
+                "db_type":       db_type,
+                "db_file_path":  d_file_path or None,
+                "max_sql_queries": int(max_sql),
+                "row_limit":     int(row_lim),
+            }
+        elif needs_bq:
             db_extra: Dict = {}
             if d_creds:
                 db_extra["credentials_path"] = d_creds
-            payload: Dict[str, Any] = {
+            payload = {
                 "natural_query": effective_query,
                 "kg_nodes":      kg_nodes,
                 "kg_edges":      kg_edges,

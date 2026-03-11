@@ -122,6 +122,7 @@ class QueryRequest(BaseModel):
     db_password:          str = ""
     db_connection_string: str = ""
     db_extra:             Dict[str, Any] = {}
+    db_file_path:         Optional[str] = None   # for SQLite / CSV / Excel
 
     # Behaviour
     max_sql_queries: int = 10
@@ -220,6 +221,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         db_password          = req.db_password,
         db_connection_string = req.db_connection_string,
         db_extra             = req.db_extra,
+        db_file_path         = req.db_file_path or "",
         llm_model            = req.llm_model,
         max_sql_queries      = req.max_sql_queries,
         row_limit            = req.row_limit,

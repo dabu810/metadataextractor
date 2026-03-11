@@ -46,16 +46,27 @@ class ExcelConnector(BaseConnector):
         self._conn.row_factory = sqlite3.Row
         self._sheets = []
 
+        used: dict = {}
         for sheet in xl.sheet_names:
-            safe = _safe_name(sheet)
+            base = _safe_name(sheet)
+            # Deduplicate: if two sheets produce the same safe name, append _2, _3 …
+            if base in used:
+                used[base] += 1
+                safe = f"{base}_{used[base]}"
+            else:
+                used[base] = 1
+                safe = base
             try:
                 df = xl.parse(sheet)
                 # Sanitise column names
                 df.columns = [_safe_name(str(c)) for c in df.columns]
                 df.to_sql(safe, self._conn, if_exists="replace", index=False)
                 self._sheets.append(safe)
-            except Exception:
-                pass  # skip unreadable sheets
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "ExcelConnector: skipping sheet %r — %s", sheet, exc
+                )
 
     def close(self) -> None:
         if self._conn:

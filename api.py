@@ -31,7 +31,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+import shutil
+
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -355,6 +357,31 @@ def discover_db(db: DBConfigIn):
                 conn.close()
             except Exception:
                 pass
+
+
+_UPLOAD_DIR = Path("/tmp/uploads")
+
+
+@app.post("/upload-file")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a single file (SQLite / Excel) into the agent container and return its path."""
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _UPLOAD_DIR / file.filename
+    with dest.open("wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+    return {"path": str(dest)}
+
+
+@app.post("/upload-files")
+async def upload_files(files: List[UploadFile] = File(...)):
+    """Upload multiple CSV files into the agent container and return the directory path."""
+    csv_dir = _UPLOAD_DIR / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    for file in files:
+        dest = csv_dir / file.filename
+        with dest.open("wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+    return {"path": str(csv_dir)}
 
 
 @app.post("/extract", status_code=202)

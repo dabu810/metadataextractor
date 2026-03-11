@@ -88,6 +88,36 @@ class APIClient:
     def search(self, q: str, scope: str = "all", db_type: str = "all") -> List[Dict]:
         return self._get("/search", params={"q": q, "scope": scope, "db_type": db_type})
 
+    def upload_file(self, file_bytes: bytes, filename: str) -> str:
+        """Upload a single file to the agent container; returns the server-side path."""
+        r = requests.post(
+            f"{self._base}/upload-file",
+            files={"file": (filename, file_bytes)},
+            timeout=120,
+        )
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
+        return r.json()["path"]
+
+    def upload_files(self, files: list) -> str:
+        """Upload multiple CSV files; returns the server-side directory path."""
+        r = requests.post(
+            f"{self._base}/upload-files",
+            files=[("files", (f.name, f.read())) for f in files],
+            timeout=120,
+        )
+        if not r.ok:
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
+        return r.json()["path"]
+
     def discover(self, payload: Dict) -> Dict:
         """Return {schemas: [...], tables: {schema: [table, ...]}} for the given DB."""
         return self._post("/discover", payload)
@@ -546,6 +576,7 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("dialog_kg_job_id", None),
                 # Schema/table discovery results
                 ("ext_disco", None),    # {schemas:[...], tables:{schema:[...]}}
+                ("ext_uploaded_path", None),  # server-side path after file upload
                 ("dlg_disco", None),
                 # Conformity agent state
                 ("conformity_job_id", None),
@@ -715,14 +746,39 @@ def _extract_view() -> None:
 
         if needs_file:
             if db_type == "csv":
-                file_path = st.text_input("CSV directory path", placeholder="/data/csvfiles/", key="ext_file_path")
-                st.caption("Mount your CSV directory into the agent container and enter its path here.")
+                uploaded = st.file_uploader(
+                    "Upload CSV file(s)", type=["csv"], accept_multiple_files=True, key="ext_file_upload"
+                )
+                st.caption("Upload one or more CSV files from your computer.")
             elif db_type == "sqlite":
-                file_path = st.text_input("SQLite file path", placeholder="/data/mydb.sqlite", key="ext_file_path")
-                st.caption("Mount your SQLite file into the agent container and enter its path here.")
+                uploaded = st.file_uploader(
+                    "Upload SQLite database", type=["sqlite", "db", "sqlite3"], key="ext_file_upload"
+                )
+                st.caption("Upload a SQLite database file from your computer.")
             else:  # excel
-                file_path = st.text_input("Excel file path (.xlsx / .xls)", placeholder="/data/report.xlsx", key="ext_file_path")
-                st.caption("Mount your Excel file into the agent container and enter its path here.")
+                uploaded = st.file_uploader(
+                    "Upload Excel file", type=["xlsx", "xls", "xlsm", "xlsb"], key="ext_file_upload"
+                )
+                st.caption("Upload an Excel file from your computer.")
+
+            # Upload button — sends the file(s) to the agent container
+            if st.button("⬆ Upload file", key="ext_upload_btn",
+                         disabled=not bool(uploaded if db_type == "csv" else uploaded)):
+                try:
+                    with st.spinner("Uploading…"):
+                        if db_type == "csv":
+                            server_path = api.upload_files(uploaded)
+                        else:
+                            server_path = api.upload_file(uploaded.read(), uploaded.name)
+                    st.session_state.ext_uploaded_path = server_path
+                    st.success(f"Uploaded → `{server_path}`")
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+                    st.session_state.ext_uploaded_path = None
+
+            file_path = st.session_state.get("ext_uploaded_path") or ""
+            if file_path:
+                st.caption(f"Server path: `{file_path}`")
             host = port = database = schema = username = password = ""
             bq_project = bq_dataset = bq_creds = spark_master = http_path = odbc_driver = ""
         elif needs_bq:

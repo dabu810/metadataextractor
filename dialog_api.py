@@ -211,12 +211,14 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
     if not req.natural_query.strip():
         raise HTTPException(status_code=400, detail="natural_query must not be empty")
 
+    _FILE_BASED = {"sqlite", "csv", "excel"}
     cfg = DialogConfig(
         db_type              = req.db_type,
         db_host              = req.db_host,
         db_port              = req.db_port,
         db_name              = req.db_name,
-        db_schema            = req.db_schema,
+        # File-based sources have no schema; force empty so planner never qualifies names
+        db_schema            = "" if req.db_type.lower() in _FILE_BASED else req.db_schema,
         db_user              = req.db_user,
         db_password          = req.db_password,
         db_connection_string = req.db_connection_string,

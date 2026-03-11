@@ -2387,6 +2387,7 @@ def _dialog_view() -> None:
                 "kg_edges":      kg_edges,
                 "db_type":       db_type,
                 "db_file_path":  d_file_path or None,
+                "db_schema":     "",   # file-based sources have no schema prefix
                 "max_sql_queries": int(max_sql),
                 "row_limit":     int(row_lim),
             }

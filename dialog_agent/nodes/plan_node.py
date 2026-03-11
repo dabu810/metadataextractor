@@ -52,12 +52,12 @@ SCHEMA CONTEXT:
 {schema_context}
 
 TARGET DATABASE TYPE: {db_type}
-TARGET SCHEMA: {db_schema}
+{schema_line}
 
 NATURAL LANGUAGE QUESTION:
 {natural_query}
 
-Remember: use the exact qualified table names from the AVAILABLE TABLES list above.
+Remember: use the exact table names from the AVAILABLE TABLES list above.
 
 Return the JSON array of SQL queries now.
 """
@@ -133,7 +133,11 @@ def plan_node(state: DialogState) -> DialogState:
         state["phase"] = "plan"
         return state
 
-    db_schema = config.db_schema or ""
+    # File-based sources (SQLite / CSV / Excel) load into in-memory SQLite with no schema
+    # prefix.  Force empty schema so the LLM and the safety-net qualify step both use
+    # bare table names.
+    _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
+    db_schema = "" if config.db_type.lower() in _FILE_BASED_TYPES else (config.db_schema or "")
 
     # Extract table labels from KG nodes for the SQL post-processor.
     # Exclude XSD data types and SQL/SPARQL keywords that must never be
@@ -162,10 +166,15 @@ def plan_node(state: DialogState) -> DialogState:
         row_limit=config.row_limit,
         max_queries=config.max_sql_queries,
     )
+    schema_line = (
+        f"TARGET SCHEMA: {db_schema}"
+        if db_schema
+        else "TARGET SCHEMA: (none — use bare table names WITHOUT any schema prefix)"
+    )
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
-        db_schema=db_schema or "(default)",
+        schema_line=schema_line,
         natural_query=natural_query,
     )
 

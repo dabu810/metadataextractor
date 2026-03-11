@@ -308,10 +308,13 @@ def discover_db(db: DBConfigIn):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid DB config: {e}")
 
-    from connectors.factory import get_connector  # noqa: PLC0415
+    conn = None
     try:
+        from metadata_agent.connectors import get_connector  # noqa: PLC0415
         conn = get_connector(db_cfg)
         conn.connect()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Could not connect: {e}")
 
@@ -331,13 +334,17 @@ def discover_db(db: DBConfigIn):
 
         return {"schemas": schemas, "tables": tables_by_schema}
 
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("discover_db failed for %s", db.db_type)
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @app.post("/extract", status_code=202)

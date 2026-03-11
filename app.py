@@ -1198,6 +1198,17 @@ def _ontology_view() -> None:
         )
         return
 
+    # Filter to only runs that have a valid, non-empty report accessible
+    valid_history = [h for h in history if h.get("report_path")]
+    if not valid_history:
+        st.markdown(
+            '<div class="empty-state"><div class="empty-state-icon">🦉</div>'
+            '<div class="empty-state-text">No completed extractions with valid reports found. '
+            'Run a metadata extraction first.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
     # ── Config + Progress ─────────────────────────────────────────────────────
     col_cfg, col_right = st.columns([3, 2], gap="large")
 
@@ -1207,7 +1218,7 @@ def _ontology_view() -> None:
         run_options = {
             f'{h.get("db_type","?").upper()}  ·  {h.get("database","?")} / '
             f'{h.get("schema","?")}  ({h.get("timestamp","")[:10]})': h["id"]
-            for h in history
+            for h in valid_history
         }
         selected_label = st.selectbox("Source extraction run", list(run_options.keys()))
         run_id = run_options[selected_label]

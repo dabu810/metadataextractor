@@ -24,14 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sys
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import shutil
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware

@@ -85,6 +85,8 @@ services:
     restart: unless-stopped
     ports:
       - "${DIALOG_PORT:-8003}:8003"
+    volumes:
+      - reports_data:/data/reports
     environment:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"

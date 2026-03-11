@@ -88,8 +88,8 @@ class APIClient:
     def search(self, q: str, scope: str = "all", db_type: str = "all") -> List[Dict]:
         return self._get("/search", params={"q": q, "scope": scope, "db_type": db_type})
 
-    def upload_file(self, file_bytes: bytes, filename: str) -> str:
-        """Upload a single file to the agent container; returns the server-side path."""
+    def upload_file(self, file_bytes: bytes, filename: str) -> Dict:
+        """Upload a single file; returns {path, expires_at}."""
         r = requests.post(
             f"{self._base}/upload-file",
             files={"file": (filename, file_bytes)},
@@ -101,10 +101,10 @@ class APIClient:
             except Exception:
                 detail = r.text
             raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
-        return r.json()["path"]
+        return r.json()
 
-    def upload_files(self, files: list) -> str:
-        """Upload multiple CSV files; returns the server-side directory path."""
+    def upload_files(self, files: list) -> Dict:
+        """Upload multiple CSV files; returns {path, expires_at}."""
         r = requests.post(
             f"{self._base}/upload-files",
             files=[("files", (f.name, f.read())) for f in files],
@@ -116,7 +116,18 @@ class APIClient:
             except Exception:
                 detail = r.text
             raise requests.HTTPError(f"HTTP {r.status_code}: {detail}", response=r)
-        return r.json()["path"]
+        return r.json()
+
+    def list_uploads(self) -> List[Dict]:
+        """Return non-expired uploaded files from the server."""
+        try:
+            return self._get("/uploads/list").get("uploads", [])
+        except Exception:
+            return []
+
+    def extend_upload(self, path: str) -> Dict:
+        """Request a one-time 15-minute extension; raises HTTPError if already extended."""
+        return self._post("/uploads/extend", {"path": path})
 
     def discover(self, payload: Dict) -> Dict:
         """Return {schemas: [...], tables: {schema: [table, ...]}} for the given DB."""
@@ -576,8 +587,10 @@ for _k, _v in [("page", "extract"), ("last_report", None),
                 ("dialog_kg_job_id", None),
                 # Schema/table discovery results
                 ("ext_disco", None),    # {schemas:[...], tables:{schema:[...]}}
-                ("ext_uploaded_path", None),  # server-side path after file upload (extraction)
-                ("dlg_uploaded_path", None),  # server-side path after file upload (dialog)
+                ("ext_uploaded_path",  None),   # server-side path after file upload (extraction)
+                ("ext_upload_expires", None),   # ISO expiry timestamp (extraction)
+                ("dlg_uploaded_path",  None),   # server-side path after file upload (dialog)
+                ("dlg_upload_expires", None),   # ISO expiry timestamp (dialog)
                 ("dlg_disco", None),
                 # Conformity agent state
                 ("conformity_job_id", None),
@@ -768,18 +781,31 @@ def _extract_view() -> None:
                 try:
                     with st.spinner("Uploading…"):
                         if db_type == "csv":
-                            server_path = api.upload_files(uploaded)
+                            result = api.upload_files(uploaded)
                         else:
-                            server_path = api.upload_file(uploaded.read(), uploaded.name)
-                    st.session_state.ext_uploaded_path = server_path
-                    st.success(f"Uploaded → `{server_path}`")
+                            result = api.upload_file(uploaded.read(), uploaded.name)
+                    st.session_state.ext_uploaded_path   = result["path"]
+                    st.session_state.ext_upload_expires  = result.get("expires_at", "")
                 except Exception as e:
                     st.error(f"Upload failed: {e}")
-                    st.session_state.ext_uploaded_path = None
+                    st.session_state.ext_uploaded_path  = None
+                    st.session_state.ext_upload_expires = None
 
-            file_path = st.session_state.get("ext_uploaded_path") or ""
+            file_path   = st.session_state.get("ext_uploaded_path") or ""
+            expires_at  = st.session_state.get("ext_upload_expires") or ""
             if file_path:
-                st.caption(f"Server path: `{file_path}`")
+                # Format expiry time to local-friendly string
+                try:
+                    from datetime import datetime, timezone
+                    exp_dt = datetime.fromisoformat(expires_at)
+                    exp_str = exp_dt.astimezone().strftime("%H:%M %Z")
+                except Exception:
+                    exp_str = expires_at
+                st.info(
+                    f"File saved on the server. It will be automatically deleted at **{exp_str}** "
+                    f"(2 hours after upload). Make sure to complete your extraction before then.",
+                    icon="⏳",
+                )
             host = port = database = schema = username = password = ""
             bq_project = bq_dataset = bq_creds = spark_master = http_path = odbc_driver = ""
         elif needs_bq:
@@ -2058,15 +2084,48 @@ def _dialog_view() -> None:
         needs_dfile = db_type in _FILE_BASED
 
         if needs_dfile:
-            # Show the previously uploaded file path (from Extraction view) if available
-            prev_path = st.session_state.get("ext_uploaded_path") or ""
-            if prev_path:
-                st.caption(f"Previously uploaded: `{prev_path}`")
-                use_prev = st.checkbox("Reuse this file", value=True, key="dlg_reuse_upload")
-            else:
-                use_prev = False
+            # ── Fetch live list of non-expired uploads matching this db_type ──
+            all_uploads  = api.list_uploads()
+            type_uploads = [u for u in all_uploads if u["db_type"] == db_type]
 
-            if not use_prev:
+            d_file_path = ""
+            dlg_expires = ""
+            dlg_extended = False
+
+            if type_uploads:
+                # Build display labels: "filename — expires HH:MM"
+                def _fmt_upload(u: Dict) -> str:
+                    try:
+                        from datetime import datetime, timezone
+                        exp_dt  = datetime.fromisoformat(u["expires_at"])
+                        exp_str = exp_dt.astimezone().strftime("%H:%M %Z")
+                    except Exception:
+                        exp_str = "?"
+                    ext_tag = " ⟳+15m used" if u["extended"] else ""
+                    return f'{u["label"]}  —  expires {exp_str}{ext_tag}'
+
+                upload_labels = [_fmt_upload(u) for u in type_uploads]
+                upload_labels.append("⬆ Upload a new file…")
+
+                sel_label = st.selectbox(
+                    "Select file", upload_labels, key="dlg_file_sel",
+                    help="Choose a file uploaded in this session or still within its 2-hour window."
+                )
+                sel_idx = upload_labels.index(sel_label)
+
+                if sel_idx < len(type_uploads):
+                    # Existing upload selected
+                    sel_upload   = type_uploads[sel_idx]
+                    d_file_path  = sel_upload["path"]
+                    dlg_expires  = sel_upload["expires_at"]
+                    dlg_extended = sel_upload["extended"]
+                else:
+                    sel_upload = None  # "upload new" chosen
+            else:
+                sel_upload = None
+
+            # Show uploader when no valid files or user chose "Upload new"
+            if sel_upload is None:
                 if db_type == "csv":
                     dlg_uploaded = st.file_uploader(
                         "Upload CSV file(s)", type=["csv"], accept_multiple_files=True, key="dlg_file_upload"
@@ -2084,19 +2143,53 @@ def _dialog_view() -> None:
                     try:
                         with st.spinner("Uploading…"):
                             if db_type == "csv":
-                                sp = api.upload_files(dlg_uploaded)
+                                result = api.upload_files(dlg_uploaded)
                             else:
-                                sp = api.upload_file(dlg_uploaded.read(), dlg_uploaded.name)
-                        st.session_state.dlg_uploaded_path = sp
-                        st.success(f"Uploaded → `{sp}`")
+                                result = api.upload_file(dlg_uploaded.read(), dlg_uploaded.name)
+                        st.session_state.dlg_uploaded_path   = result["path"]
+                        st.session_state.dlg_upload_expires  = result.get("expires_at", "")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Upload failed: {e}")
-                        st.session_state.dlg_uploaded_path = None
 
-            d_file_path = (prev_path if use_prev
-                           else st.session_state.get("dlg_uploaded_path") or "")
+                d_file_path = st.session_state.get("dlg_uploaded_path") or ""
+                dlg_expires = st.session_state.get("dlg_upload_expires") or ""
+
+            # ── Expiry banner + one-time extend button ─────────────────────────
             if d_file_path:
-                st.caption(f"Server path: `{d_file_path}`")
+                try:
+                    from datetime import datetime, timezone
+                    exp_dt  = datetime.fromisoformat(dlg_expires)
+                    exp_str = exp_dt.astimezone().strftime("%H:%M %Z")
+                except Exception:
+                    exp_str = "?"
+
+                info_col, btn_col = st.columns([3, 1])
+                info_col.info(
+                    f"File will be deleted at **{exp_str}**. "
+                    + ("Extension already used — no further extensions available."
+                       if dlg_extended
+                       else "You may extend once by +15 min."),
+                    icon="⏳",
+                )
+                if not dlg_extended:
+                    with btn_col:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("⏱ +15 min", key="dlg_extend_btn",
+                                     help="Extend this file's lifetime by 15 minutes (one time only)"):
+                            try:
+                                new_exp = api.extend_upload(d_file_path)
+                                st.success(
+                                    f"Extended! File now expires at "
+                                    f"{datetime.fromisoformat(new_exp['expires_at']).astimezone().strftime('%H:%M %Z')}."
+                                )
+                                st.rerun()
+                            except requests.HTTPError as e:
+                                if "already_extended" in str(e):
+                                    st.warning("This file has already been extended once.")
+                                else:
+                                    st.error(f"Could not extend: {e}")
+
             d_host = d_port = d_dbname = d_user = d_password = d_schema_name = ""
             d_project = d_schema = d_creds = ""
         elif needs_bq:

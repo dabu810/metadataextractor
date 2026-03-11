@@ -27,8 +27,9 @@ import logging
 import shutil
 import sys
 import threading
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -358,29 +359,141 @@ def discover_db(db: DBConfigIn):
                 pass
 
 
-_UPLOAD_DIR = Path("/tmp/uploads")
+# ── File upload storage ────────────────────────────────────────────────────────
+UPLOAD_TTL_SECONDS    = 2 * 60 * 60   # base TTL: 2 hours
+UPLOAD_EXTEND_SECONDS = 15 * 60       # one-time extension: +15 minutes
+UPLOAD_PURGE_INTERVAL = 15 * 60       # purge sweep every 15 minutes
+_UPLOAD_DIR = DATA_DIR / "uploads"
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Registry: path → {uploaded_at, expires_at, extended, db_type, label}
+_upload_registry: Dict[str, Dict] = {}
+_registry_lock   = threading.Lock()
+
+
+def _db_type_from_path(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext in (".xlsx", ".xls", ".xlsm", ".xlsb"):
+        return "excel"
+    if ext in (".sqlite", ".db", ".sqlite3"):
+        return "sqlite"
+    if Path(path).is_dir():
+        return "csv"
+    return "unknown"
+
+
+def _ts(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def _register_upload(path: str, db_type: str, label: str) -> float:
+    """Record an upload; return its expiry epoch."""
+    expires = time.time() + UPLOAD_TTL_SECONDS
+    with _registry_lock:
+        _upload_registry[path] = {
+            "uploaded_at": time.time(),
+            "expires_at":  expires,
+            "extended":    False,
+            "db_type":     db_type,
+            "label":       label,
+        }
+    return expires
+
+
+def _purge_old_uploads() -> None:
+    """Remove entries (and files/dirs) whose expiry has passed."""
+    now = time.time()
+    with _registry_lock:
+        expired = [p for p, m in _upload_registry.items() if m["expires_at"] < now]
+    for path in expired:
+        try:
+            p = Path(path)
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+            logger.info("Purged expired upload: %s", path)
+        except Exception as exc:
+            logger.debug("Could not purge %s: %s", path, exc)
+        with _registry_lock:
+            _upload_registry.pop(path, None)
+
+
+def _upload_purge_loop() -> None:
+    while True:
+        time.sleep(UPLOAD_PURGE_INTERVAL)
+        _purge_old_uploads()
+
+
+threading.Thread(target=_upload_purge_loop, daemon=True, name="upload-purge").start()
 
 
 @app.post("/upload-file")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload a single file (SQLite / Excel) into the agent container and return its path."""
+    """Upload a single file (SQLite / Excel); returns path, expires_at, db_type."""
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     dest = _UPLOAD_DIR / file.filename
     with dest.open("wb") as buf:
         shutil.copyfileobj(file.file, buf)
-    return {"path": str(dest)}
+    db_type  = _db_type_from_path(str(dest))
+    expires  = _register_upload(str(dest), db_type, file.filename)
+    return {"path": str(dest), "expires_at": _ts(expires), "db_type": db_type}
 
 
 @app.post("/upload-files")
 async def upload_files(files: List[UploadFile] = File(...)):
-    """Upload multiple CSV files into the agent container and return the directory path."""
+    """Upload multiple CSV files; returns directory path + expiry."""
     csv_dir = _UPLOAD_DIR / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
+    names = []
     for file in files:
         dest = csv_dir / file.filename
         with dest.open("wb") as buf:
             shutil.copyfileobj(file.file, buf)
-    return {"path": str(csv_dir)}
+        names.append(file.filename)
+    label   = ", ".join(names)
+    expires = _register_upload(str(csv_dir), "csv", label)
+    return {"path": str(csv_dir), "expires_at": _ts(expires), "db_type": "csv"}
+
+
+@app.get("/uploads/list")
+def list_uploads():
+    """Return all non-expired uploads with expiry info."""
+    now = time.time()
+    with _registry_lock:
+        items = [
+            {
+                "path":       path,
+                "label":      meta["label"],
+                "db_type":    meta["db_type"],
+                "expires_at": _ts(meta["expires_at"]),
+                "extended":   meta["extended"],
+                "seconds_left": max(0, int(meta["expires_at"] - now)),
+            }
+            for path, meta in _upload_registry.items()
+            if meta["expires_at"] > now
+        ]
+    return {"uploads": items}
+
+
+class ExtendRequest(BaseModel):
+    path: str
+
+
+@app.post("/uploads/extend")
+def extend_upload(req: ExtendRequest):
+    """Grant a one-time 15-minute extension for an uploaded file."""
+    with _registry_lock:
+        meta = _upload_registry.get(req.path)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Upload not found or already expired.")
+        if meta["extended"]:
+            raise HTTPException(status_code=409, detail="already_extended")
+        meta["expires_at"] += UPLOAD_EXTEND_SECONDS
+        meta["extended"]    = True
+        new_expires = meta["expires_at"]
+    logger.info("Extended upload TTL by 15 min: %s (new expiry %s)", req.path, _ts(new_expires))
+    return {"expires_at": _ts(new_expires), "extended": True}
 
 
 @app.post("/extract", status_code=202)

@@ -16,9 +16,10 @@ class SQLServerConnector(BaseConnector):
         try:
             import pyodbc
             if self._config.connection_string:
-                self._conn = pyodbc.connect(self._config.connection_string)
+                self._conn = pyodbc.connect(self._config.connection_string, timeout=30)
             else:
                 driver = self._config.extra.get("driver", "ODBC Driver 18 for SQL Server")
+                timeout = int(self._config.extra.get("login_timeout", 30))
                 cs = (
                     f"DRIVER={{{driver}}};"
                     f"SERVER={self._config.host},{self._config.port or 1433};"
@@ -26,8 +27,23 @@ class SQLServerConnector(BaseConnector):
                     f"UID={self._config.username};"
                     f"PWD={self._config.password};"
                     "TrustServerCertificate=yes;"
+                    f"LoginTimeout={timeout};"
+                    "Encrypt=yes;"
                 )
-                self._conn = pyodbc.connect(cs)
+                try:
+                    self._conn = pyodbc.connect(cs, timeout=timeout)
+                except pyodbc.Error as exc:
+                    state = exc.args[0] if exc.args else ""
+                    msg   = exc.args[1] if len(exc.args) > 1 else str(exc)
+                    if "HYT00" in str(state) or "timeout" in msg.lower():
+                        raise ConnectionError(
+                            f"Login timeout connecting to SQL Server at "
+                            f"{self._config.host}:{self._config.port or 1433}. "
+                            "Check that: (1) the host/IP is correct, "
+                            "(2) port 1433 is open and reachable, "
+                            "(3) SQL Server is running and allows remote connections."
+                        ) from exc
+                    raise
         except ImportError:
             try:
                 import pymssql
@@ -37,6 +53,7 @@ class SQLServerConnector(BaseConnector):
                     database=self._config.database,
                     user=self._config.username,
                     password=self._config.password,
+                    login_timeout=30,
                 )
             except ImportError:
                 raise ImportError(

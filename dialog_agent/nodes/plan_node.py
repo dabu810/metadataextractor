@@ -47,6 +47,11 @@ Rules:
 8. Maximum {max_queries} queries total.
 9. Do NOT use table aliases that shadow schema-qualified names — always write the
    full qualified reference in FROM/JOIN clauses.
+9b. JOIN conditions: ONLY join two tables using a column that is explicitly listed
+    in BOTH tables' column lists in the schema context, OR is shown in a FK line
+    (e.g. "FK: rel -> OtherTable (col_a = col_b)").  NEVER invent a join key that
+    is not visible in the schema.  If no shared column or FK is shown, do NOT join
+    those tables — query each table separately instead.
 10. String/text filters: ALWAYS use case-insensitive matching.
     - If [sample values] are shown for a column, use the exact spelling from the samples.
     - If sample values are NOT shown, use: LOWER(column_name) LIKE LOWER('%search_term%')
@@ -70,6 +75,9 @@ NATURAL LANGUAGE QUESTION:
 CRITICAL REMINDERS:
 - Use ONLY column names that appear in the DETAILED SCHEMA above. Do NOT invent column names.
 - Use ONLY table names from the AVAILABLE TABLES list above.
+- For JOIN ON conditions: use ONLY columns explicitly listed in both tables' schemas or shown
+  on a FK line. NEVER guess or invent a join key (e.g. do not use Check_PC, PC_ID, or any
+  column unless it appears in the schema for both tables being joined).
 - For any text/string filter, use case-insensitive matching (LOWER() LIKE or exact sample value).
 - If [sample values] are shown for a column, pick the matching value verbatim from that list.
 
@@ -259,6 +267,23 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
         return sql
 
 
+def _has_hallucinated_join(sql: str, bad_cols: List[str]) -> bool:
+    """
+    Return True if any of bad_cols appear inside a JOIN ... ON clause.
+    These cannot be salvaged by stripping a WHERE condition — the whole
+    query must be dropped.
+    """
+    # Find every ON ... block (up to the next keyword that ends it)
+    on_blocks = re.findall(
+        r'\bON\b\s+(.+?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bLIMIT\b|\bJOIN\b|$)',
+        sql, re.IGNORECASE | re.DOTALL,
+    )
+    if not on_blocks:
+        return False
+    on_text = " ".join(on_blocks).lower()
+    return any(col.lower() in on_text for col in bad_cols)
+
+
 def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     """
     Safety net: if the LLM wrote `FROM orders` but the schema is `public`,
@@ -383,11 +408,24 @@ def plan_node(state: DialogState) -> DialogState:
 
         # Column hallucination check: strip conditions that reference columns not
         # in the schema context (e.g. md.Check_PC invented by the LLM).
-        # We strip the bad condition rather than dropping the whole query so the
-        # rest of the query can still run and return useful data.
+        # If the hallucinated column appears in a JOIN ON clause we cannot salvage
+        # the query — drop it entirely.  For WHERE/AND/OR conditions we strip the
+        # bad predicate and keep the rest.
         if known_columns:
             bad_cols = _find_hallucinated_columns(sql, known_columns)
             if bad_cols:
+                if _has_hallucinated_join(sql, bad_cols):
+                    logger.warning(
+                        "plan_node: dropping query %s — hallucinated column(s) %s "
+                        "used in JOIN ON clause (cannot salvage). SQL: %s",
+                        item.get("query_id", "?"), bad_cols, sql[:200],
+                    )
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} skipped — "
+                        f"hallucinated JOIN key(s): {bad_cols}"
+                    )
+                    continue
+
                 logger.warning(
                     "plan_node: query %s references unknown column(s) %s — "
                     "stripping those conditions. SQL: %s",

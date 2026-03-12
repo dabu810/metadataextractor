@@ -30,24 +30,36 @@ _SAMPLE_LIMIT = 8
 _SAMPLE_DISTINCT_MAX = 200
 
 
+def _to_sql_col(name: str) -> str:
+    """
+    Sanitize a column name to a valid SQLite identifier.
+    Must match execute_node._safe_col exactly so the schema context
+    uses the same column names that are actually stored in SQLite.
+    """
+    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+    return ("col_" + s if s and s[0].isdigit() else s) or "col"
+
+
+def _to_sql_table(name: str) -> str:
+    """Sanitize a table/sheet name to a valid SQLite identifier."""
+    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+    return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
+
+
 def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
     """
     Load the file-based source and collect up to _SAMPLE_LIMIT distinct non-null
     values for every column in every table.  Returns:
-        { table_name: { col_name: [val1, val2, ...] } }
+        { sql_table_name: { sql_col_name: [val1, val2, ...] } }
+    Keys use the sanitized (SQL-safe) names that execute_node actually stores.
     Returns empty dict on any failure.
     """
-    import re as _re
     import sqlite3
 
     db = config.db_type.lower()
     fpath = config.db_file_path
     if not fpath:
         return {}
-
-    def _safe(name: str) -> str:
-        s = _re.sub(r"[^A-Za-z0-9_]", "_", str(name))
-        return ("s_" + s if s and s[0].isdigit() else s) or "col"
 
     try:
         if db == "sqlite":
@@ -61,11 +73,10 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
                 for f in sorted(Path(fpath).glob("*.csv")):
                     try:
                         df = pd.read_csv(f)
-                        # deduplicate columns
                         used: dict = {}
                         new_cols = []
                         for c in df.columns:
-                            sc = _safe(str(c))
+                            sc = _to_sql_col(str(c))
                             if sc in used:
                                 used[sc] += 1
                                 sc = f"{sc}_{used[sc]}"
@@ -80,7 +91,7 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
                 xl = pd.ExcelFile(fpath)
                 used_sheets: dict = {}
                 for sheet in xl.sheet_names:
-                    base = _safe(sheet)
+                    base = _to_sql_table(sheet)
                     if base in used_sheets:
                         used_sheets[base] += 1
                         safe_sheet = f"{base}_{used_sheets[base]}"
@@ -92,7 +103,7 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
                         used_cols: dict = {}
                         new_cols = []
                         for c in df.columns:
-                            sc = _safe(str(c))
+                            sc = _to_sql_col(str(c))
                             if sc in used_cols:
                                 used_cols[sc] += 1
                                 sc = f"{sc}_{used_cols[sc]}"
@@ -274,14 +285,21 @@ def _summarise_graph(
         cols = _extract_columns_from_title(title, label)
         if cols:
             lines.append("  Columns:")
-            tbl_samples = (samples or {}).get(label, {})
+            # For file-based sources, look up sample values using the sanitized
+            # table name, since that is what is actually stored in SQLite.
+            sql_table = _to_sql_table(label) if samples is not None else label
+            tbl_samples = (samples or {}).get(sql_table, {})
             for col in cols:
-                col_name = col.split(":")[0].strip()
-                sample_vals = tbl_samples.get(col_name)
+                original_col = col.split(":")[0].strip()
+                col_type     = col[len(original_col):].strip()  # e.g. ": integer"
+                # Translate original KG column name → SQL-safe name used in SQLite
+                sql_col = _to_sql_col(original_col) if samples is not None else original_col
+                sample_vals = tbl_samples.get(sql_col)
+                display = f"{sql_col}{col_type}" if samples is not None else col
                 if sample_vals:
-                    lines.append(f"    {col}  [sample values: {', '.join(repr(v) for v in sample_vals)}]")
+                    lines.append(f"    {display}  [sample values: {', '.join(repr(v) for v in sample_vals)}]")
                 else:
-                    lines.append(f"    {col}")
+                    lines.append(f"    {display}")
 
         # Foreign-key relationships (edges)
         for edge in edges_by_src.get(node_id, []):

@@ -158,9 +158,10 @@ def _build_file_conn(cfg: DialogConfig):
     db    = cfg.db_type.lower()
     fpath = cfg.db_file_path
 
-    def _safe_sheet(name: str) -> str:
+    def _safe_table(name: str) -> str:
+        """Must match understand_node._to_sql_table so table names are consistent."""
         s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
-        return ("sheet_" + s if s and s[0].isdigit() else s) or "sheet"
+        return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
 
     if db == "sqlite":
         conn = sqlite3.connect(fpath, check_same_thread=False)
@@ -187,7 +188,7 @@ def _build_file_conn(cfg: DialogConfig):
         xl = pd.ExcelFile(fpath)
         used_sheets: dict = {}
         for sheet in xl.sheet_names:
-            base = _safe_sheet(sheet)
+            base = _safe_table(sheet)
             if base in used_sheets:
                 used_sheets[base] += 1
                 safe = f"{base}_{used_sheets[base]}"

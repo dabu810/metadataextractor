@@ -262,7 +262,10 @@ def _summarise_graph(
     for node in nodes:
         label = node.get("label", "")
         if label:
-            lines.append(f"  - {_qualified(db_schema, label)}")
+            # For file-based sources, show the sanitized SQLite table name so
+            # the LLM generates SQL that actually matches what is in SQLite.
+            sql_name = _to_sql_table(label) if samples is not None else label
+            lines.append(f"  - {_qualified(db_schema, sql_name)}")
     lines.append("")
 
     # ── Section 2: Detailed schema per table ──────────────────────────────────
@@ -274,7 +277,10 @@ def _summarise_graph(
         label     = node.get("label", node_id)
         title     = node.get("title", "")
 
-        qualified_name = _qualified(db_schema, label)
+        # For file-based sources, display the sanitized table name (the actual
+        # SQLite table name) so the LLM writes correct FROM/JOIN clauses.
+        display_table = _to_sql_table(label) if samples is not None else label
+        qualified_name = _qualified(db_schema, display_table)
         lines.append(f"\nTable: {qualified_name}")
 
         # Metadata comments (row_count, FD hints)
@@ -304,7 +310,8 @@ def _summarise_graph(
         # Foreign-key relationships (edges)
         for edge in edges_by_src.get(node_id, []):
             tgt_label = node_label_by_id.get(edge.get("to", ""), edge.get("to", "?"))
-            tgt_qualified = _qualified(db_schema, tgt_label)
+            tgt_display = _to_sql_table(tgt_label) if samples is not None else tgt_label
+            tgt_qualified = _qualified(db_schema, tgt_display)
             edge_title = edge.get("title", "")
             rel_lbl    = edge.get("label", "")
             lines.append(

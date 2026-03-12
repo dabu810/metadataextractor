@@ -107,6 +107,80 @@ def _extract_json(text: str) -> List[Dict[str, Any]]:
     return json.loads(cleaned[start:end + 1])
 
 
+def _extract_known_columns(schema_context: str) -> set:
+    """
+    Parse the schema context text produced by understand_node and return a
+    lower-cased set of every column name listed under 'Columns:' sections.
+    Used to reject SQL that references hallucinated column names.
+    """
+    known: set = set()
+    in_columns = False
+    for line in schema_context.splitlines():
+        stripped = line.strip()
+        if stripped.lower() == "columns:":
+            in_columns = True
+            continue
+        if in_columns:
+            # Column lines look like: "col_name: integer  [sample values: ...]"
+            # or just "col_name: integer"
+            # Stop at blank lines, table headers, FK lines, or section dividers
+            if not stripped or stripped.startswith("Table:") or stripped.startswith("FK:") \
+                    or stripped.startswith("--") or stripped.startswith("=") \
+                    or stripped.startswith("-"):
+                in_columns = False
+                continue
+            col_name = stripped.split(":")[0].split("[")[0].strip()
+            if col_name:
+                known.add(col_name.lower())
+    return known
+
+
+# SQL keywords and functions that look like identifiers but are never column names
+_SQL_KEYWORDS = {
+    "select", "from", "where", "join", "inner", "left", "right", "outer",
+    "on", "group", "order", "by", "having", "limit", "offset", "as",
+    "and", "or", "not", "null", "true", "false", "case", "when", "then",
+    "else", "end", "in", "between", "like", "is", "distinct", "all", "any",
+    "exists", "union", "intersect", "except", "with", "values", "set",
+    "count", "sum", "avg", "min", "max", "coalesce", "cast", "lower",
+    "upper", "trim", "substr", "length", "round", "abs", "ifnull",
+    "strftime", "date", "datetime", "asc", "desc", "over", "partition",
+    "row_number", "rank", "iif", "replace", "typeof",
+}
+
+
+def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
+    """
+    Find column references in the form  alias.ColumnName  where ColumnName is
+    NOT in the known schema.  This pattern (e.g. md.Check_PC) is the most
+    reliable hallucination signal — the LLM uses a table alias and a column it
+    invented from domain knowledge.
+
+    We intentionally limit the check to dotted references to avoid false
+    positives from table/alias names that are not in known_cols.
+    """
+    if not known_cols:
+        return []
+
+    # Strip string literals so quoted values don't confuse the regex
+    sql_stripped = re.sub(r"'[^']*'", "''", sql)
+
+    hallucinated = []
+    seen: set = set()
+    # Match   word.Identifier   where Identifier is not followed by '(' (functions)
+    for m in re.finditer(r'\b[A-Za-z_]\w*\.([A-Za-z_]\w*)(?!\s*\()', sql_stripped):
+        col = m.group(1)
+        low = col.lower()
+        if low in _SQL_KEYWORDS:
+            continue
+        if low in known_cols:
+            continue
+        if low not in seen:
+            hallucinated.append(col)
+            seen.add(low)
+    return hallucinated
+
+
 def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     """
     Safety net: if the LLM wrote `FROM orders` but the schema is `public`,
@@ -171,10 +245,26 @@ def plan_node(state: DialogState) -> DialogState:
         "union", "intersect", "except", "with", "values", "set",
     }
     kg_nodes     = state.get("kg_nodes") or []
+    _is_file_based = config.db_type.lower() in _FILE_BASED_TYPES
+
+    def _sql_table(name: str) -> str:
+        """Sanitize a table name — must match understand_node._to_sql_table."""
+        import re as _re
+        s = _re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+        return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
+
     table_labels = [
-        n.get("label", "") for n in kg_nodes
+        (_sql_table(n["label"]) if _is_file_based else n["label"])
+        for n in kg_nodes
         if n.get("label") and n.get("label", "").lower() not in _EXCLUDED_LABELS
     ]
+
+    # Build a set of all valid column names from the schema context so we can
+    # reject any SQL the LLM generates using hallucinated column names.
+    known_columns = _extract_known_columns(schema_context)
+    # Add table labels as valid identifiers (they can appear bare in SQL too)
+    known_columns.update(t.lower() for t in table_labels)
+    logger.debug("plan_node: %d known columns extracted from schema context", len(known_columns))
 
     system = _SYSTEM_PROMPT.format(
         row_limit=config.row_limit,
@@ -212,6 +302,22 @@ def plan_node(state: DialogState) -> DialogState:
         sql = item["sql"].strip()
         # Safety net: ensure table names are schema-qualified even if LLM forgot
         sql = _qualify_sql(sql, db_schema, table_labels)
+
+        # Column hallucination check: if known_columns is non-empty, reject any
+        # query that references a column not in the schema context.
+        if known_columns:
+            bad_cols = _find_hallucinated_columns(sql, known_columns)
+            if bad_cols:
+                logger.warning(
+                    "plan_node: dropping query %s — references unknown column(s) %s "
+                    "(not in schema context). SQL: %s",
+                    item.get("query_id", "?"), bad_cols, sql[:200],
+                )
+                state["errors"].append(
+                    f"plan_node: query {item.get('query_id','?')} skipped — "
+                    f"hallucinated column(s): {bad_cols}"
+                )
+                continue
 
         sql_queries.append(
             SQLQuery(

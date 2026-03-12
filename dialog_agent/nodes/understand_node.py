@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from ..config import DialogConfig
 from ..state import DialogState
+from .execute_node import _get_cached_file_db
 
 logger = logging.getLogger(__name__)
 
@@ -48,77 +49,25 @@ def _to_sql_table(name: str) -> str:
 
 def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
     """
-    Load the file-based source and collect up to _SAMPLE_LIMIT distinct non-null
-    values for every column in every table.  Returns:
-        { sql_table_name: { sql_col_name: [val1, val2, ...] } }
-    Keys use the sanitized (SQL-safe) names that execute_node actually stores.
-    Returns empty dict on any failure.
+    Collect up to _SAMPLE_LIMIT distinct non-null values per column by querying
+    the shared cached temp SQLite DB (built by execute_node._get_cached_file_db).
+    Returns { sql_table_name: { sql_col_name: [val1, ...] } }, or {} on failure.
     """
     import sqlite3
 
-    db = config.db_type.lower()
+    db    = config.db_type.lower()
     fpath = config.db_file_path
     if not fpath:
         return {}
 
-    _tmp_path: Optional[str] = None
     try:
         if db == "sqlite":
             conn = sqlite3.connect(fpath, check_same_thread=False)
         else:
-            import pandas as pd
-            import tempfile as _tempfile
-            _tmp = _tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-            _tmp.close()
-            _tmp_path = _tmp.name
-            conn = sqlite3.connect(_tmp_path, check_same_thread=False)
-
-            if db == "csv":
-                from pathlib import Path
-                for f in sorted(Path(fpath).glob("*.csv")):
-                    try:
-                        df = pd.read_csv(f)
-                        used: dict = {}
-                        new_cols = []
-                        for c in df.columns:
-                            sc = _to_sql_col(str(c))
-                            if sc in used:
-                                used[sc] += 1
-                                sc = f"{sc}_{used[sc]}"
-                            else:
-                                used[sc] = 1
-                            new_cols.append(sc)
-                        df.columns = new_cols
-                        df.to_sql(f.stem, conn, if_exists="replace", index=False)
-                    except Exception:
-                        pass
-            else:  # excel
-                xl = pd.ExcelFile(fpath)
-                used_sheets: dict = {}
-                for sheet in xl.sheet_names:
-                    base = _to_sql_table(sheet)
-                    if base in used_sheets:
-                        used_sheets[base] += 1
-                        safe_sheet = f"{base}_{used_sheets[base]}"
-                    else:
-                        used_sheets[base] = 1
-                        safe_sheet = base
-                    try:
-                        df = xl.parse(sheet)
-                        used_cols: dict = {}
-                        new_cols = []
-                        for c in df.columns:
-                            sc = _to_sql_col(str(c))
-                            if sc in used_cols:
-                                used_cols[sc] += 1
-                                sc = f"{sc}_{used_cols[sc]}"
-                            else:
-                                used_cols[sc] = 1
-                            new_cols.append(sc)
-                        df.columns = new_cols
-                        df.to_sql(safe_sheet, conn, if_exists="replace", index=False)
-                    except Exception:
-                        pass
+            # Reuse the same cached temp DB that execute_node will query —
+            # this also pre-warms the cache so the first query is fast.
+            tmp_path = _get_cached_file_db(config)
+            conn = sqlite3.connect(tmp_path, check_same_thread=False)
 
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -132,12 +81,10 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
                 col_samples: Dict[str, List] = {}
                 for col in cols:
                     try:
-                        cur.execute(
-                            f'SELECT COUNT(DISTINCT "{col}") FROM "{tbl}"'
-                        )
+                        cur.execute(f'SELECT COUNT(DISTINCT "{col}") FROM "{tbl}"')
                         distinct_count = (cur.fetchone() or [0])[0]
                         if distinct_count > _SAMPLE_DISTINCT_MAX:
-                            continue  # skip high-cardinality columns (IDs etc.)
+                            continue
                         cur.execute(
                             f'SELECT DISTINCT "{col}" FROM "{tbl}" '
                             f'WHERE "{col}" IS NOT NULL LIMIT {_SAMPLE_LIMIT}'
@@ -153,22 +100,10 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
                 pass
 
         conn.close()
-        if _tmp_path:
-            try:
-                import os as _os
-                _os.unlink(_tmp_path)
-            except Exception:
-                pass
         return samples
 
     except Exception as exc:
         logger.warning("understand_node: sample_file_data failed — %s", exc)
-        if _tmp_path:
-            try:
-                import os as _os
-                _os.unlink(_tmp_path)
-            except Exception:
-                pass
         return {}
 
 

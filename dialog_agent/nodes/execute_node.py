@@ -4,10 +4,29 @@ execute_node — Run each planned SQL query against the target database.
 Uses a minimal inline connector (psycopg2/pyodbc/etc.) driven by the
 DialogConfig.  Errors on individual queries are captured and do not abort
 the whole pipeline.
+
+File-based sources (CSV / Excel)
+---------------------------------
+The first time a file path is seen, the data is loaded into a temporary
+SQLite database file on disk (not :memory:, so SQLite can spill aggregation
+buffers and never hits "database or disk is full").  That temp file is
+**cached** keyed by the original file path so every subsequent request
+reuses the already-loaded DB — no re-parsing on each query.
+
+The cached DB is kept alive until the caller explicitly invokes
+``purge_file_db(fpath)`` or ``purge_all_file_dbs()``.  The dialog_api
+exposes a ``DELETE /file-cache`` endpoint that triggers the purge when the
+user navigates away from the Dialog with Data section.
 """
 from __future__ import annotations
 
 import logging
+import os
+import re
+import sqlite3
+import tempfile
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DialogConfig
@@ -16,16 +35,198 @@ from ..state import DialogState, QueryResult
 logger = logging.getLogger(__name__)
 
 
+# ── File-DB cache ─────────────────────────────────────────────────────────────
+# Maps original file path → path of the pre-loaded temp SQLite DB file.
+# Protected by _FILE_DB_LOCK for thread safety.
+
+_FILE_DB_CACHE: Dict[str, str] = {}
+_FILE_DB_LOCK  = threading.Lock()
+
+_FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
+
+
+def purge_file_db(fpath: str) -> bool:
+    """
+    Delete the cached SQLite temp file for *fpath* and remove it from cache.
+    Returns True if an entry was found and removed, False otherwise.
+    Safe to call even if the entry does not exist.
+    """
+    with _FILE_DB_LOCK:
+        tmp = _FILE_DB_CACHE.pop(fpath, None)
+    if tmp:
+        try:
+            os.unlink(tmp)
+            logger.info("file_db_cache: purged %s → %s", fpath, tmp)
+        except Exception as exc:
+            logger.warning("file_db_cache: could not delete %s — %s", tmp, exc)
+        return True
+    return False
+
+
+def purge_all_file_dbs() -> int:
+    """
+    Delete all cached temp SQLite files.  Returns the number of entries removed.
+    Call this when the user navigates away from the Dialog with Data section.
+    """
+    with _FILE_DB_LOCK:
+        entries = dict(_FILE_DB_CACHE)
+        _FILE_DB_CACHE.clear()
+    count = 0
+    for fpath, tmp in entries.items():
+        try:
+            os.unlink(tmp)
+            logger.info("file_db_cache: purged %s → %s", fpath, tmp)
+            count += 1
+        except Exception as exc:
+            logger.warning("file_db_cache: could not delete %s — %s", tmp, exc)
+    return count
+
+
+def list_file_dbs() -> Dict[str, str]:
+    """Return a snapshot of {original_path: temp_db_path} for all cached DBs."""
+    with _FILE_DB_LOCK:
+        return dict(_FILE_DB_CACHE)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _safe_col(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+    return ("col_" + s if s and s[0].isdigit() else s) or "col"
+
+
+def _safe_table(name: str) -> str:
+    """Must match understand_node._to_sql_table so table names are consistent."""
+    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+    return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
+
+
+def _dedup_cols(df) -> None:
+    """Deduplicate DataFrame column names in-place after sanitisation."""
+    used: dict = {}
+    new_cols = []
+    for c in df.columns:
+        sc = _safe_col(str(c))
+        if sc in used:
+            used[sc] += 1
+            sc = f"{sc}_{used[sc]}"
+        else:
+            used[sc] = 1
+        new_cols.append(sc)
+    df.columns = new_cols
+
+
+def _load_file_to_db(db_type: str, fpath: str, tmp_path: str) -> None:
+    """
+    Load a CSV directory or Excel file into the SQLite database at *tmp_path*.
+    Raises on unrecoverable errors so the caller can fall back gracefully.
+    """
+    import pandas as pd
+
+    conn = sqlite3.connect(tmp_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        if db_type == "csv":
+            for f in sorted(Path(fpath).glob("*.csv")):
+                try:
+                    df = pd.read_csv(f)
+                    _dedup_cols(df)
+                    tname = _safe_table(f.stem)
+                    df.to_sql(tname, conn, if_exists="replace", index=False)
+                    logger.info("file_db: loaded CSV %s → %s (%d rows, %d cols)",
+                                f.name, tname, len(df), len(df.columns))
+                except Exception as exc:
+                    logger.warning("file_db: skipping CSV %s — %s", f.name, exc)
+        else:  # excel
+            xl = pd.ExcelFile(fpath)
+            used_sheets: dict = {}
+            for sheet in xl.sheet_names:
+                base = _safe_table(sheet)
+                if base in used_sheets:
+                    used_sheets[base] += 1
+                    safe = f"{base}_{used_sheets[base]}"
+                else:
+                    used_sheets[base] = 1
+                    safe = base
+                try:
+                    df = xl.parse(sheet)
+                    _dedup_cols(df)
+                    df.to_sql(safe, conn, if_exists="replace", index=False)
+                    logger.info("file_db: loaded sheet %r → %r (%d rows, %d cols)",
+                                sheet, safe, len(df), len(df.columns))
+                except Exception as exc:
+                    logger.warning("file_db: skipping sheet %r → %r — %s",
+                                   sheet, safe, exc)
+
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        loaded = [r[0] for r in cur.fetchall()]
+        cur.close()
+        logger.info("file_db: tables in %s: %s", tmp_path, loaded)
+    finally:
+        conn.close()
+
+
+def _get_cached_file_db(cfg: DialogConfig) -> str:
+    """
+    Return the path of the pre-loaded temp SQLite DB for *cfg.db_file_path*.
+    Builds and caches on first call; returns instantly on subsequent calls.
+    """
+    fpath = cfg.db_file_path
+    db    = cfg.db_type.lower()
+
+    with _FILE_DB_LOCK:
+        if fpath in _FILE_DB_CACHE:
+            tmp = _FILE_DB_CACHE[fpath]
+            if os.path.exists(tmp):
+                logger.info("file_db_cache: HIT %s → %s", fpath, tmp)
+                return tmp
+            # Stale entry (file was deleted externally) — rebuild
+            logger.warning("file_db_cache: stale entry for %s, rebuilding", fpath)
+            _FILE_DB_CACHE.pop(fpath, None)
+
+        # Build the temp DB (lock held so only one thread loads it)
+        tmp_f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp_f.close()
+        tmp_path = tmp_f.name
+
+    try:
+        logger.info("file_db_cache: MISS %s — loading into %s", fpath, tmp_path)
+        _load_file_to_db(db, fpath, tmp_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+    with _FILE_DB_LOCK:
+        _FILE_DB_CACHE[fpath] = tmp_path
+
+    return tmp_path
+
+
+def _open_file_conn(cfg: DialogConfig) -> sqlite3.Connection:
+    """Open (or reuse) a connection to the cached temp SQLite DB."""
+    if cfg.db_type.lower() == "sqlite":
+        conn = sqlite3.connect(cfg.db_file_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    tmp_path = _get_cached_file_db(cfg)
+    conn = sqlite3.connect(tmp_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 # ── Thin DB runner ────────────────────────────────────────────────────────────
 
 def _run_sql(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     """
     Execute *sql* and return {columns, rows, error}.
     Supports postgres/redshift, oracle, sqlserver, bigquery, sqlite, csv, excel.
-    Falls back to a generic error for unsupported types.
     """
     db = cfg.db_type.lower()
-
     try:
         if db in ("postgres", "redshift"):
             return _run_postgres(cfg, sql)
@@ -35,8 +236,6 @@ def _run_sql(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             return _run_sqlserver(cfg, sql)
         elif db == "bigquery":
             return _run_bigquery(cfg, sql)
-        elif db in ("sqlite", "csv", "excel"):
-            return _run_file_based(cfg, sql)
         else:
             return {"columns": [], "rows": [], "error": f"Unsupported db_type: {db}"}
     except Exception as exc:
@@ -65,9 +264,6 @@ def _run_postgres(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     conn.autocommit = True
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Set search_path so unqualified table names resolve to the right schema.
-            # This is a defence-in-depth measure: the LLM should already qualify names,
-            # but this ensures the query works even if it doesn't.
             if cfg.db_schema:
                 cur.execute(f"SET search_path TO {cfg.db_schema}, public")
             cur.execute(sql)
@@ -89,7 +285,6 @@ def _run_oracle(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         conn = cx_Oracle.connect(cfg.db_user, cfg.db_password, dsn)
     try:
         with conn.cursor() as cur:
-            # Set current schema so unqualified names resolve correctly
             if cfg.db_schema:
                 cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {cfg.db_schema}")
             cur.execute(sql)
@@ -111,7 +306,6 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         )
     try:
         with conn.cursor() as cur:
-            # Switch to the target schema so unqualified names resolve correctly
             if cfg.db_schema:
                 cur.execute(f"USE [{cfg.db_name}]")
                 cur.execute(f"SET SCHEMA [{cfg.db_schema}]")
@@ -119,138 +313,6 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             return _cursor_to_result(cur)
     finally:
         conn.close()
-
-
-_FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
-
-
-def _safe_col(name: str) -> str:
-    import re
-    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
-    return ("col_" + s if s and s[0].isdigit() else s) or "col"
-
-
-def _dedup_cols(df) -> None:
-    """Deduplicate DataFrame column names in-place after sanitisation."""
-    used: dict = {}
-    new_cols = []
-    for c in df.columns:
-        sc = _safe_col(str(c))
-        if sc in used:
-            used[sc] += 1
-            sc = f"{sc}_{used[sc]}"
-        else:
-            used[sc] = 1
-        new_cols.append(sc)
-    df.columns = new_cols
-
-
-def _build_file_conn(cfg: DialogConfig):
-    """
-    Load a file-based source (SQLite / CSV / Excel) into a sqlite3 connection.
-    The connection is returned open — caller is responsible for closing it.
-    File is loaded ONCE so multiple SQL queries can reuse the same connection.
-
-    CSV/Excel sources are loaded into a temp-file SQLite database (not :memory:)
-    so that SQLite can spill sort/aggregation buffers to disk and never hits the
-    "database or disk is full" error that `:memory:` raises on large datasets.
-    """
-    import re
-    import sqlite3
-    import tempfile
-    from pathlib import Path
-
-    db    = cfg.db_type.lower()
-    fpath = cfg.db_file_path
-
-    def _safe_table(name: str) -> str:
-        """Must match understand_node._to_sql_table so table names are consistent."""
-        s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
-        return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
-
-    if db == "sqlite":
-        conn = sqlite3.connect(fpath, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    import pandas as pd
-    # Use a named temp file so SQLite can spill to disk; delete=False so it
-    # persists while the connection is open, then we clean it up on close.
-    _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    _tmp.close()
-    _tmp_path = _tmp.name
-    conn = sqlite3.connect(_tmp_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    # Attach the temp path so caller can unlink it after closing
-    conn._tmp_path = _tmp_path  # type: ignore[attr-defined]
-
-    if db == "csv":
-        dir_path = Path(fpath)
-        for f in sorted(dir_path.glob("*.csv")):
-            try:
-                df = pd.read_csv(f)
-                _dedup_cols(df)
-                df.to_sql(f.stem, conn, if_exists="replace", index=False)
-                logger.info("file_conn: loaded CSV %s (%d rows, %d cols)",
-                            f.stem, len(df), len(df.columns))
-            except Exception as exc:
-                logger.warning("file_conn: skipping CSV %s — %s: %s",
-                               f.name, type(exc).__name__, exc)
-    else:  # excel
-        xl = pd.ExcelFile(fpath)
-        used_sheets: dict = {}
-        for sheet in xl.sheet_names:
-            base = _safe_table(sheet)
-            if base in used_sheets:
-                used_sheets[base] += 1
-                safe = f"{base}_{used_sheets[base]}"
-            else:
-                used_sheets[base] = 1
-                safe = base
-            try:
-                df = xl.parse(sheet)
-                _dedup_cols(df)
-                df.to_sql(safe, conn, if_exists="replace", index=False)
-                logger.info("file_conn: loaded sheet %r → %r (%d rows, %d cols)",
-                            sheet, safe, len(df), len(df.columns))
-            except Exception as exc:
-                logger.warning("file_conn: skipping sheet %r → %r — %s: %s",
-                               sheet, safe, type(exc).__name__, exc)
-
-    # Log what actually made it in so mismatches are visible
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    loaded = [r[0] for r in cur.fetchall()]
-    cur.close()
-    logger.info("file_conn: tables available: %s", loaded)
-    return conn
-
-
-def _exec_on_conn(conn, sql: str) -> Dict[str, Any]:
-    """Run one SQL statement on an already-open sqlite3 connection."""
-    import sqlite3
-    try:
-        cur = conn.cursor()
-        cur.execute(sql)
-        cols = [d[0] for d in (cur.description or [])]
-        rows = [list(r) for r in (cur.fetchall() or [])]
-        cur.close()
-        return {"columns": cols, "rows": rows, "error": None}
-    except sqlite3.Error as exc:
-        # Enrich "no such table" with the list of available tables
-        msg = str(exc)
-        if "no such table" in msg.lower():
-            try:
-                c2 = conn.cursor()
-                c2.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                available = [r[0] for r in c2.fetchall()]
-                c2.close()
-                msg += f" (available tables: {available})"
-            except Exception:
-                pass
-        return {"columns": [], "rows": [], "error": msg}
-    except Exception as exc:
-        return {"columns": [], "rows": [], "error": str(exc)}
 
 
 def _run_bigquery(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
@@ -270,6 +332,31 @@ def _run_bigquery(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     return {"columns": columns, "rows": rows, "error": None}
 
 
+def _exec_on_conn(conn, sql: str) -> Dict[str, Any]:
+    """Run one SQL statement on an already-open sqlite3 connection."""
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = [list(r) for r in (cur.fetchall() or [])]
+        cur.close()
+        return {"columns": cols, "rows": rows, "error": None}
+    except sqlite3.Error as exc:
+        msg = str(exc)
+        if "no such table" in msg.lower():
+            try:
+                c2 = conn.cursor()
+                c2.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                available = [r[0] for r in c2.fetchall()]
+                c2.close()
+                msg += f" (available tables: {available})"
+            except Exception:
+                pass
+        return {"columns": [], "rows": [], "error": msg}
+    except Exception as exc:
+        return {"columns": [], "rows": [], "error": str(exc)}
+
+
 # ── node ──────────────────────────────────────────────────────────────────────
 
 def execute_node(state: DialogState) -> DialogState:
@@ -285,14 +372,15 @@ def execute_node(state: DialogState) -> DialogState:
         state["phase"] = "execute"
         return state
 
-    # For file-based sources, load the file ONCE and reuse the connection for
-    # every query — avoids re-parsing the entire Excel/CSV on each SQL call.
+    # For file-based sources open a connection to the (cached) temp SQLite DB.
+    # The DB file persists until explicitly purged via purge_file_db() /
+    # purge_all_file_dbs() — it is NOT deleted after each request.
     file_conn = None
     if config.db_type.lower() in _FILE_BASED_TYPES:
         try:
-            file_conn = _build_file_conn(config)
+            file_conn = _open_file_conn(config)
         except Exception as exc:
-            logger.exception("execute_node: failed to build file connection")
+            logger.exception("execute_node: failed to open file connection")
             state["errors"].append(f"execute_node: could not load file — {exc}")
             state["query_results"] = []
             state["phase"] = "execute"
@@ -331,19 +419,12 @@ def execute_node(state: DialogState) -> DialogState:
                 logger.info("  %s OK — %d rows returned", q["query_id"], len(rows))
 
     finally:
+        # Close the connection to the cached DB — the DB file itself stays on disk
         if file_conn is not None:
-            tmp_path = getattr(file_conn, "_tmp_path", None)
             try:
                 file_conn.close()
             except Exception:
                 pass
-            # Remove the temp SQLite file created for CSV/Excel sources
-            if tmp_path:
-                try:
-                    import os as _os
-                    _os.unlink(tmp_path)
-                except Exception:
-                    pass
 
     state["query_results"] = results
     state["phase"] = "execute"

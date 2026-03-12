@@ -40,6 +40,11 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dialog_agent import DialogAgent, DialogConfig
+from dialog_agent.nodes.execute_node import (
+    list_file_dbs,
+    purge_all_file_dbs,
+    purge_file_db,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -351,3 +356,33 @@ def clear_cache():
         _nlq_cache.clear()
     logger.info("NLQ cache cleared: %d entries removed", count)
     return {"deleted_count": count}
+
+
+# ── File-DB cache endpoints ────────────────────────────────────────────────────
+# Call DELETE /file-cache when the user navigates away from the Dialog with Data
+# section to release the temp SQLite files that were built for CSV/Excel sources.
+
+@app.get("/file-cache")
+def list_file_cache():
+    """List all cached temp SQLite DBs (original path → temp file path)."""
+    return list_file_dbs()
+
+
+@app.delete("/file-cache", status_code=200)
+def clear_file_cache():
+    """
+    Delete all cached temp SQLite files built from CSV/Excel sources.
+    Call this when the user leaves the Dialog with Data section.
+    """
+    count = purge_all_file_dbs()
+    logger.info("file_db_cache cleared: %d temp DB(s) removed", count)
+    return {"deleted_count": count}
+
+
+@app.delete("/file-cache/{file_path:path}", status_code=200)
+def delete_file_cache_entry(file_path: str):
+    """Delete the cached temp SQLite DB for a specific source file path."""
+    removed = purge_file_db(file_path)
+    if not removed:
+        raise HTTPException(status_code=404, detail="No cached DB for that path")
+    return {"deleted": file_path}

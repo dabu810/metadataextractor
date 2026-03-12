@@ -97,12 +97,45 @@ def _call_llm(
 
 
 def _extract_json(text: str) -> List[Dict[str, Any]]:
-    """Extract JSON array from LLM response (handles markdown fences)."""
+    """
+    Extract a JSON array from the LLM response.
+
+    Uses bracket-counting to find the exact closing bracket for the first
+    top-level '[', so trailing text (notes, explanations, etc.) containing
+    ']' characters does not cause a JSONDecodeError.
+    """
     cleaned = re.sub(r"```(?:json)?\s*", "", text).strip()
     cleaned = cleaned.rstrip("`").strip()
+
     start = cleaned.find("[")
-    end   = cleaned.rfind("]")
-    if start == -1 or end == -1:
+    if start == -1:
+        return []
+
+    depth = 0
+    in_string = False
+    escape = False
+    end = -1
+    for i, ch in enumerate(cleaned[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    if end == -1:
         return []
     return json.loads(cleaned[start:end + 1])
 

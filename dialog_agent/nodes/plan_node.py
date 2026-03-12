@@ -181,6 +181,51 @@ def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
     return hallucinated
 
 
+def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
+    """
+    Remove WHERE / AND / OR conditions that reference hallucinated dotted columns
+    (e.g. ``AND md.Check_PC = 'X'``).  Returns cleaned SQL so the rest of the
+    query can still execute.  Falls back to the original SQL on any error.
+
+    Handles the three most common placements:
+      1. WHERE alias.col op value  (sole condition → remove entire WHERE clause)
+      2. WHERE alias.col op value AND next_cond  (→ convert next_cond to WHERE)
+      3. AND/OR alias.col op value  (→ remove the AND/OR arm)
+    """
+    try:
+        for col in bad_cols:
+            cp = re.escape(col)
+            # Value token: a quoted string, a number, or a bare word (handles =, LIKE, IN, IS)
+            val = r"""(?:'[^']*'|\([^)]*\)|[^\s,)]+)"""
+            op  = r"(?:=|!=|<>|>=|<=|>|<|(?:NOT\s+)?LIKE|(?:NOT\s+)?IN|IS(?:\s+NOT)?)"
+
+            # Case 3: AND/OR condition  — simplest, remove the entire arm
+            sql = re.sub(
+                r"(?i)\s+(?:AND|OR)\s+\w+\." + cp + r"\s+" + op + r"\s*" + val,
+                "",
+                sql,
+            )
+
+            # Case 2: WHERE col ... AND next → replace with WHERE next
+            sql = re.sub(
+                r"(?i)\bWHERE\s+\w+\." + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
+                "WHERE ",
+                sql,
+            )
+
+            # Case 1: WHERE col ... (nothing follows, or clause keywords follow)
+            sql = re.sub(
+                r"(?i)\s+WHERE\s+\w+\." + cp + r"\s+" + op + r"\s*" + val
+                + r"(?=\s*(?:GROUP\b|ORDER\b|HAVING\b|LIMIT\b|$))",
+                "",
+                sql,
+            )
+
+        return sql.strip()
+    except Exception:
+        return sql
+
+
 def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     """
     Safety net: if the LLM wrote `FROM orders` but the schema is `public`,
@@ -303,21 +348,36 @@ def plan_node(state: DialogState) -> DialogState:
         # Safety net: ensure table names are schema-qualified even if LLM forgot
         sql = _qualify_sql(sql, db_schema, table_labels)
 
-        # Column hallucination check: if known_columns is non-empty, reject any
-        # query that references a column not in the schema context.
+        # Column hallucination check: strip conditions that reference columns not
+        # in the schema context (e.g. md.Check_PC invented by the LLM).
+        # We strip the bad condition rather than dropping the whole query so the
+        # rest of the query can still run and return useful data.
         if known_columns:
             bad_cols = _find_hallucinated_columns(sql, known_columns)
             if bad_cols:
                 logger.warning(
-                    "plan_node: dropping query %s — references unknown column(s) %s "
-                    "(not in schema context). SQL: %s",
+                    "plan_node: query %s references unknown column(s) %s — "
+                    "stripping those conditions. SQL: %s",
                     item.get("query_id", "?"), bad_cols, sql[:200],
                 )
-                state["errors"].append(
-                    f"plan_node: query {item.get('query_id','?')} skipped — "
-                    f"hallucinated column(s): {bad_cols}"
-                )
-                continue
+                sql = _strip_hallucinated_conditions(sql, bad_cols)
+                # After stripping, verify no bad columns remain; drop only if still present
+                still_bad = _find_hallucinated_columns(sql, known_columns)
+                if still_bad:
+                    logger.warning(
+                        "plan_node: dropping query %s — could not remove all "
+                        "hallucinated columns %s", item.get("query_id", "?"), still_bad,
+                    )
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} skipped — "
+                        f"unremovable hallucinated column(s): {still_bad}"
+                    )
+                    continue
+                else:
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} — "
+                        f"stripped hallucinated condition(s) for column(s): {bad_cols}"
+                    )
 
         sql_queries.append(
             SQLQuery(

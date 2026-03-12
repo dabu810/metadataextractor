@@ -47,11 +47,23 @@ Rules:
 8. Maximum {max_queries} queries total.
 9. Do NOT use table aliases that shadow schema-qualified names — always write the
    full qualified reference in FROM/JOIN clauses.
-9b. JOIN conditions: ONLY use a column listed under "POSSIBLE JOIN KEYS" in the
-    schema context, or one shown on a "FK:" line.  NEVER invent or guess a join
-    key — do not use any column name (e.g. Check_PC, CP_ID, PC_ID, Center_ID)
-    that is not explicitly in the POSSIBLE JOIN KEYS list.  If no join key is
-    listed for two tables you want to join, query them separately instead.
+9b. CROSS-TABLE RULES — read carefully:
+    a. To JOIN two tables you MUST have a column listed under "POSSIBLE JOIN KEYS"
+       in the schema context, or one shown on a "FK:" line.
+       NEVER invent or guess a join key (e.g. Check_PC, CP_ID, PC_ID, Center_ID).
+    b. If no POSSIBLE JOIN KEYS are listed between two tables you want to combine,
+       you MUST query each table SEPARATELY — one query per table.
+       Do NOT use any of these workarounds to fake a cross-table result:
+         • subqueries that reference a second table (e.g. WHERE x IN (SELECT ...))
+         • correlated subqueries
+         • EXISTS / NOT EXISTS against a second table
+         • scalar subqueries that pull a value from another table
+         • CROSS JOIN or implicit comma-joins
+       Each query in your JSON array must reference ONLY ONE table (or joined
+       tables with a valid key).  The synthesise step will combine the results.
+    c. If a column you need (e.g. SBU1) is only in Table A, write a query for
+       Table A that retrieves it.  Write a second query for Table B with its
+       own columns.  Do NOT try to bridge them without a valid join key.
 10. String/text filters: ALWAYS use case-insensitive matching.
     - If [sample values] are shown for a column, use the exact spelling from the samples.
     - If sample values are NOT shown, use: LOWER(column_name) LIKE LOWER('%search_term%')
@@ -75,9 +87,9 @@ NATURAL LANGUAGE QUESTION:
 CRITICAL REMINDERS:
 - Use ONLY column names that appear in the DETAILED SCHEMA above. Do NOT invent column names.
 - Use ONLY table names from the AVAILABLE TABLES list above.
-- For JOIN ON conditions: use ONLY a column listed under "POSSIBLE JOIN KEYS" in the schema
-  above, or shown on a FK line. NEVER guess or invent a join key. If no POSSIBLE JOIN KEYS
-  are listed for the tables you want to join, do NOT join them — query each table separately.
+- CROSS-TABLE: If no POSSIBLE JOIN KEYS exist between two tables, query them SEPARATELY.
+  Do NOT use subqueries, IN (...), EXISTS, correlated queries, or any trick to combine
+  data from two tables that have no valid join key. One query = one table (or validly joined tables).
 - For any text/string filter, use case-insensitive matching (LOWER() LIKE or exact sample value).
 - If [sample values] are shown for a column, pick the matching value verbatim from that list.
 
@@ -269,19 +281,32 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
 
 def _has_hallucinated_join(sql: str, bad_cols: List[str]) -> bool:
     """
-    Return True if any of bad_cols appear inside a JOIN ... ON clause.
-    These cannot be salvaged by stripping a WHERE condition — the whole
-    query must be dropped.
+    Return True if any of bad_cols appear in a context that cannot be salvaged
+    by stripping a WHERE condition.  Covers:
+      • JOIN ... ON alias.bad_col = ...
+      • Subqueries / IN (...) / EXISTS (...) that reference bad_col
     """
-    # Find every ON ... block (up to the next keyword that ends it)
+    sql_lower = sql.lower()
+
+    # Check JOIN ON blocks
     on_blocks = re.findall(
         r'\bON\b\s+(.+?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bLIMIT\b|\bJOIN\b|$)',
         sql, re.IGNORECASE | re.DOTALL,
     )
-    if not on_blocks:
-        return False
-    on_text = " ".join(on_blocks).lower()
-    return any(col.lower() in on_text for col in bad_cols)
+    if on_blocks:
+        on_text = " ".join(on_blocks).lower()
+        if any(col.lower() in on_text for col in bad_cols):
+            return True
+
+    # Check inside any subquery parentheses (catches IN (...), EXISTS (...), scalar)
+    # A subquery contains SELECT, so look for (... SELECT ... bad_col ...)
+    subquery_blocks = re.findall(r'\(([^()]*\bSELECT\b[^()]*)\)', sql, re.IGNORECASE | re.DOTALL)
+    for block in subquery_blocks:
+        block_lower = block.lower()
+        if any(col.lower() in block_lower for col in bad_cols):
+            return True
+
+    return False
 
 
 def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
@@ -405,6 +430,32 @@ def plan_node(state: DialogState) -> DialogState:
         sql = item["sql"].strip()
         # Safety net: ensure table names are schema-qualified even if LLM forgot
         sql = _qualify_sql(sql, db_schema, table_labels)
+
+        # Multi-table check: reject any query that references more than one table
+        # when no valid join key was listed in the schema context.  This catches
+        # "cross-reference approach" patterns (subqueries, IN (...), EXISTS, etc.)
+        # that the LLM uses to sneak cross-table lookups past the JOIN ON check.
+        tables_in_sql = [
+            t for t in table_labels
+            if re.search(r'\b' + re.escape(t) + r'\b', sql, re.IGNORECASE)
+        ]
+        if len(tables_in_sql) > 1:
+            # Check whether the schema advertises a valid join key for this pair
+            possible_join_section = ""
+            if "POSSIBLE JOIN KEYS" in schema_context:
+                possible_join_section = schema_context
+            elif "JOIN KEYS: No columns" in schema_context:
+                # Explicit "no join keys" message — drop immediately
+                logger.warning(
+                    "plan_node: dropping query %s — references %d tables %s but "
+                    "schema has no POSSIBLE JOIN KEYS. SQL: %s",
+                    item.get("query_id", "?"), len(tables_in_sql), tables_in_sql, sql[:200],
+                )
+                state["errors"].append(
+                    f"plan_node: query {item.get('query_id','?')} skipped — "
+                    f"cross-table reference with no valid join key: {tables_in_sql}"
+                )
+                continue
 
         # Column hallucination check: strip conditions that reference columns not
         # in the schema context (e.g. md.Check_PC invented by the LLM).

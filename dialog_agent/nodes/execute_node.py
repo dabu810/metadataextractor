@@ -121,81 +121,123 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         conn.close()
 
 
-def _run_file_based(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
-    """Run SQL against a SQLite / CSV / Excel source using sqlite3 + pandas directly."""
+_FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
+
+
+def _safe_col(name: str) -> str:
+    import re
+    s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+    return ("col_" + s if s and s[0].isdigit() else s) or "col"
+
+
+def _dedup_cols(df) -> None:
+    """Deduplicate DataFrame column names in-place after sanitisation."""
+    used: dict = {}
+    new_cols = []
+    for c in df.columns:
+        sc = _safe_col(str(c))
+        if sc in used:
+            used[sc] += 1
+            sc = f"{sc}_{used[sc]}"
+        else:
+            used[sc] = 1
+        new_cols.append(sc)
+    df.columns = new_cols
+
+
+def _build_file_conn(cfg: DialogConfig):
+    """
+    Load a file-based source (SQLite / CSV / Excel) into a sqlite3 connection.
+    The connection is returned open — caller is responsible for closing it.
+    File is loaded ONCE so multiple SQL queries can reuse the same connection.
+    """
     import re
     import sqlite3
     from pathlib import Path
 
-    db      = cfg.db_type.lower()
-    fpath   = cfg.db_file_path
+    db    = cfg.db_type.lower()
+    fpath = cfg.db_file_path
 
-    def _safe(name: str) -> str:
+    def _safe_sheet(name: str) -> str:
         s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
         return ("sheet_" + s if s and s[0].isdigit() else s) or "sheet"
 
     if db == "sqlite":
-        sqlite_conn = sqlite3.connect(fpath, check_same_thread=False)
-    else:
-        import pandas as pd
-        sqlite_conn = sqlite3.connect(":memory:", check_same_thread=False)
-        if db == "csv":
-            dir_path = Path(fpath)
-            for f in sorted(dir_path.glob("*.csv")):
-                try:
-                    df = pd.read_csv(f)
-                    used_cols: dict = {}
-                    new_cols = []
-                    for c in df.columns:
-                        sc = _safe(str(c))
-                        if sc in used_cols:
-                            used_cols[sc] += 1
-                            sc = f"{sc}_{used_cols[sc]}"
-                        else:
-                            used_cols[sc] = 1
-                        new_cols.append(sc)
-                    df.columns = new_cols
-                    df.to_sql(f.stem, sqlite_conn, if_exists="replace", index=False)
-                except Exception:
-                    pass
-        else:  # excel
-            xl = pd.ExcelFile(fpath)
-            used: dict = {}
-            for sheet in xl.sheet_names:
-                base = _safe(sheet)
-                if base in used:
-                    used[base] += 1
-                    safe = f"{base}_{used[base]}"
-                else:
-                    used[base] = 1
-                    safe = base
-                try:
-                    df = xl.parse(sheet)
-                    # Deduplicate column names after sanitisation to prevent df.to_sql failure
-                    used_cols: dict = {}
-                    new_cols = []
-                    for c in df.columns:
-                        sc = _safe(str(c))
-                        if sc in used_cols:
-                            used_cols[sc] += 1
-                            sc = f"{sc}_{used_cols[sc]}"
-                        else:
-                            used_cols[sc] = 1
-                        new_cols.append(sc)
-                    df.columns = new_cols
-                    df.to_sql(safe, sqlite_conn, if_exists="replace", index=False)
-                except Exception:
-                    pass
+        conn = sqlite3.connect(fpath, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    sqlite_conn.row_factory = sqlite3.Row
+    import pandas as pd
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+
+    if db == "csv":
+        dir_path = Path(fpath)
+        for f in sorted(dir_path.glob("*.csv")):
+            try:
+                df = pd.read_csv(f)
+                _dedup_cols(df)
+                df.to_sql(f.stem, conn, if_exists="replace", index=False)
+                logger.info("file_conn: loaded CSV %s (%d rows, %d cols)",
+                            f.stem, len(df), len(df.columns))
+            except Exception as exc:
+                logger.warning("file_conn: skipping CSV %s — %s: %s",
+                               f.name, type(exc).__name__, exc)
+    else:  # excel
+        xl = pd.ExcelFile(fpath)
+        used_sheets: dict = {}
+        for sheet in xl.sheet_names:
+            base = _safe_sheet(sheet)
+            if base in used_sheets:
+                used_sheets[base] += 1
+                safe = f"{base}_{used_sheets[base]}"
+            else:
+                used_sheets[base] = 1
+                safe = base
+            try:
+                df = xl.parse(sheet)
+                _dedup_cols(df)
+                df.to_sql(safe, conn, if_exists="replace", index=False)
+                logger.info("file_conn: loaded sheet %r → %r (%d rows, %d cols)",
+                            sheet, safe, len(df), len(df.columns))
+            except Exception as exc:
+                logger.warning("file_conn: skipping sheet %r → %r — %s: %s",
+                               sheet, safe, type(exc).__name__, exc)
+
+    # Log what actually made it in so mismatches are visible
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    loaded = [r[0] for r in cur.fetchall()]
+    cur.close()
+    logger.info("file_conn: tables available: %s", loaded)
+    return conn
+
+
+def _exec_on_conn(conn, sql: str) -> Dict[str, Any]:
+    """Run one SQL statement on an already-open sqlite3 connection."""
+    import sqlite3
     try:
-        cur = sqlite_conn.cursor()
+        cur = conn.cursor()
         cur.execute(sql)
         cols = [d[0] for d in (cur.description or [])]
         rows = [list(r) for r in (cur.fetchall() or [])]
+        cur.close()
         return {"columns": cols, "rows": rows, "error": None}
-    finally:
-        sqlite_conn.close()
+    except sqlite3.Error as exc:
+        # Enrich "no such table" with the list of available tables
+        msg = str(exc)
+        if "no such table" in msg.lower():
+            try:
+                c2 = conn.cursor()
+                c2.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                available = [r[0] for r in c2.fetchall()]
+                c2.close()
+                msg += f" (available tables: {available})"
+            except Exception:
+                pass
+        return {"columns": [], "rows": [], "error": msg}
+    except Exception as exc:
+        return {"columns": [], "rows": [], "error": str(exc)}
 
 
 def _run_bigquery(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
@@ -230,33 +272,57 @@ def execute_node(state: DialogState) -> DialogState:
         state["phase"] = "execute"
         return state
 
+    # For file-based sources, load the file ONCE and reuse the connection for
+    # every query — avoids re-parsing the entire Excel/CSV on each SQL call.
+    file_conn = None
+    if config.db_type.lower() in _FILE_BASED_TYPES:
+        try:
+            file_conn = _build_file_conn(config)
+        except Exception as exc:
+            logger.exception("execute_node: failed to build file connection")
+            state["errors"].append(f"execute_node: could not load file — {exc}")
+            state["query_results"] = []
+            state["phase"] = "execute"
+            return state
+
     results: List[QueryResult] = []
 
-    for q in sql_queries:
-        logger.info("  Running %s: %s", q["query_id"], q["description"])
-        outcome = _run_sql(config, q["sql"])
+    try:
+        for q in sql_queries:
+            logger.info("  Running %s: %s", q["query_id"], q["description"])
+            if file_conn is not None:
+                outcome = _exec_on_conn(file_conn, q["sql"])
+            else:
+                outcome = _run_sql(config, q["sql"])
 
-        rows      = outcome.get("rows") or []
-        columns   = outcome.get("columns") or []
-        error_msg: Optional[str] = outcome.get("error")
+            rows      = outcome.get("rows") or []
+            columns   = outcome.get("columns") or []
+            error_msg: Optional[str] = outcome.get("error")
 
-        results.append(
-            QueryResult(
-                query_id    = q["query_id"],
-                description = q["description"],
-                sql         = q["sql"],
-                columns     = columns,
-                rows        = rows[: config.row_limit],
-                row_count   = len(rows),
-                error       = error_msg,
+            results.append(
+                QueryResult(
+                    query_id    = q["query_id"],
+                    description = q["description"],
+                    sql         = q["sql"],
+                    columns     = columns,
+                    rows        = rows[: config.row_limit],
+                    row_count   = len(rows),
+                    error       = error_msg,
+                )
             )
-        )
 
-        if error_msg:
-            logger.warning("  %s FAILED: %s", q["query_id"], error_msg)
-            state["errors"].append(f"execute_node [{q['query_id']}]: {error_msg}")
-        else:
-            logger.info("  %s OK — %d rows returned", q["query_id"], len(rows))
+            if error_msg:
+                logger.warning("  %s FAILED: %s", q["query_id"], error_msg)
+                state["errors"].append(f"execute_node [{q['query_id']}]: {error_msg}")
+            else:
+                logger.info("  %s OK — %d rows returned", q["query_id"], len(rows))
+
+    finally:
+        if file_conn is not None:
+            try:
+                file_conn.close()
+            except Exception:
+                pass
 
     state["query_results"] = results
     state["phase"] = "execute"

@@ -144,7 +144,17 @@ def _run_file_based(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             for f in sorted(dir_path.glob("*.csv")):
                 try:
                     df = pd.read_csv(f)
-                    df.columns = [c.replace(" ", "_").replace("-", "_") for c in df.columns]
+                    used_cols: dict = {}
+                    new_cols = []
+                    for c in df.columns:
+                        sc = _safe(str(c))
+                        if sc in used_cols:
+                            used_cols[sc] += 1
+                            sc = f"{sc}_{used_cols[sc]}"
+                        else:
+                            used_cols[sc] = 1
+                        new_cols.append(sc)
+                    df.columns = new_cols
                     df.to_sql(f.stem, sqlite_conn, if_exists="replace", index=False)
                 except Exception:
                     pass
@@ -161,7 +171,18 @@ def _run_file_based(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
                     safe = base
                 try:
                     df = xl.parse(sheet)
-                    df.columns = [_safe(c) for c in df.columns]
+                    # Deduplicate column names after sanitisation to prevent df.to_sql failure
+                    used_cols: dict = {}
+                    new_cols = []
+                    for c in df.columns:
+                        sc = _safe(str(c))
+                        if sc in used_cols:
+                            used_cols[sc] += 1
+                            sc = f"{sc}_{used_cols[sc]}"
+                        else:
+                            used_cols[sc] = 1
+                        new_cols.append(sc)
+                    df.columns = new_cols
                     df.to_sql(safe, sqlite_conn, if_exists="replace", index=False)
                 except Exception:
                     pass

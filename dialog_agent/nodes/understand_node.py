@@ -268,6 +268,46 @@ def _summarise_graph(
             lines.append(f"  - {_qualified(db_schema, sql_name)}")
     lines.append("")
 
+    # ── Section 1b: Shared columns (valid join keys) ───────────────────────────
+    # Build a map of sanitized-column-name → [table_names] so we can surface
+    # the ONLY columns that legitimately appear in multiple tables.  The LLM
+    # must use one of these as a JOIN key; it must NOT invent its own.
+    col_to_tables: Dict[str, List[str]] = {}
+    for node in nodes:
+        lbl   = node.get("label", "")
+        title = node.get("title", "")
+        sql_tbl = _to_sql_table(lbl) if samples is not None else lbl
+        for col_def in _extract_columns_from_title(title, lbl):
+            orig = col_def.split(":")[0].strip()
+            sql_col = _to_sql_col(orig) if samples is not None else orig
+            col_to_tables.setdefault(sql_col.lower(), []).append(
+                _qualified(db_schema, sql_tbl)
+            )
+
+    shared_cols = {
+        col: tbls
+        for col, tbls in col_to_tables.items()
+        if len(tbls) >= 2
+    }
+
+    if shared_cols:
+        lines.append(
+            "POSSIBLE JOIN KEYS — columns that exist in multiple tables "
+            "(ONLY these may be used in JOIN ON conditions):"
+        )
+        for col, tbls in sorted(shared_cols.items()):
+            lines.append(f"  - {col}: shared by {', '.join(tbls)}")
+        lines.append(
+            "WARNING: Do NOT use any column in a JOIN ON clause unless it "
+            "appears in this list or is shown on a FK line below."
+        )
+    else:
+        lines.append(
+            "JOIN KEYS: No columns are shared between tables according to the "
+            "schema. Do NOT join these tables — query each one separately."
+        )
+    lines.append("")
+
     # ── Section 2: Detailed schema per table ──────────────────────────────────
     lines.append("DETAILED SCHEMA:")
     lines.append("-" * 60)

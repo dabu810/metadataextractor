@@ -47,11 +47,11 @@ Rules:
 8. Maximum {max_queries} queries total.
 9. Do NOT use table aliases that shadow schema-qualified names — always write the
    full qualified reference in FROM/JOIN clauses.
-9b. JOIN conditions: ONLY join two tables using a column that is explicitly listed
-    in BOTH tables' column lists in the schema context, OR is shown in a FK line
-    (e.g. "FK: rel -> OtherTable (col_a = col_b)").  NEVER invent a join key that
-    is not visible in the schema.  If no shared column or FK is shown, do NOT join
-    those tables — query each table separately instead.
+9b. JOIN conditions: ONLY use a column listed under "POSSIBLE JOIN KEYS" in the
+    schema context, or one shown on a "FK:" line.  NEVER invent or guess a join
+    key — do not use any column name (e.g. Check_PC, CP_ID, PC_ID, Center_ID)
+    that is not explicitly in the POSSIBLE JOIN KEYS list.  If no join key is
+    listed for two tables you want to join, query them separately instead.
 10. String/text filters: ALWAYS use case-insensitive matching.
     - If [sample values] are shown for a column, use the exact spelling from the samples.
     - If sample values are NOT shown, use: LOWER(column_name) LIKE LOWER('%search_term%')
@@ -75,9 +75,9 @@ NATURAL LANGUAGE QUESTION:
 CRITICAL REMINDERS:
 - Use ONLY column names that appear in the DETAILED SCHEMA above. Do NOT invent column names.
 - Use ONLY table names from the AVAILABLE TABLES list above.
-- For JOIN ON conditions: use ONLY columns explicitly listed in both tables' schemas or shown
-  on a FK line. NEVER guess or invent a join key (e.g. do not use Check_PC, PC_ID, or any
-  column unless it appears in the schema for both tables being joined).
+- For JOIN ON conditions: use ONLY a column listed under "POSSIBLE JOIN KEYS" in the schema
+  above, or shown on a FK line. NEVER guess or invent a join key. If no POSSIBLE JOIN KEYS
+  are listed for the tables you want to join, do NOT join them — query each table separately.
 - For any text/string filter, use case-insensitive matching (LOWER() LIKE or exact sample value).
 - If [sample values] are shown for a column, pick the matching value verbatim from that list.
 

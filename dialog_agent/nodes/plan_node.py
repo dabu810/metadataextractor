@@ -38,13 +38,23 @@ Rules:
 3. Table names MUST be written exactly as shown in the AVAILABLE TABLES list in the
    schema context — including the schema prefix (e.g. `public.orders`, not just `orders`).
    If no schema is listed, use the bare table name.
-4. Column names MUST match exactly the column names in the schema context.
+4. Column names MUST match EXACTLY the column names listed in the schema context.
+   NEVER invent or guess a column name that is not explicitly listed.
+   If a column you need does not appear in the schema, omit that filter entirely.
 5. Apply LIMIT {row_limit} to every query.
 6. Prefer simple queries; only join when necessary.
 7. If the question cannot be answered from the available schema, return [].
 8. Maximum {max_queries} queries total.
 9. Do NOT use table aliases that shadow schema-qualified names — always write the
    full qualified reference in FROM/JOIN clauses.
+10. String/text filters: ALWAYS use case-insensitive matching.
+    - If [sample values] are shown for a column, use the exact spelling from the samples.
+    - If sample values are NOT shown, use: LOWER(column_name) LIKE LOWER('%search_term%')
+    - Never rely on an exact case-sensitive equality match for text unless you copied
+      the value directly from a [sample values] list.
+11. Date/period filters: if filtering by year/month, check column names in the schema
+    carefully — use the correct column (e.g. Year, Month, Period) and match the sample
+    value format (e.g. integer 2026 vs string '2026').
 """
 
 _USER_PROMPT = """\
@@ -57,7 +67,11 @@ TARGET DATABASE TYPE: {db_type}
 NATURAL LANGUAGE QUESTION:
 {natural_query}
 
-Remember: use the exact table names from the AVAILABLE TABLES list above.
+CRITICAL REMINDERS:
+- Use ONLY column names that appear in the DETAILED SCHEMA above. Do NOT invent column names.
+- Use ONLY table names from the AVAILABLE TABLES list above.
+- For any text/string filter, use case-insensitive matching (LOWER() LIKE or exact sample value).
+- If [sample values] are shown for a column, pick the matching value verbatim from that list.
 
 Return the JSON array of SQL queries now.
 """

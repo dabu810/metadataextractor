@@ -22,6 +22,127 @@ from ..state import DialogState
 
 logger = logging.getLogger(__name__)
 
+_FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
+
+# Max distinct sample values shown per column in the schema context
+_SAMPLE_LIMIT = 8
+# Only sample columns whose distinct count is <= this (to skip IDs/timestamps)
+_SAMPLE_DISTINCT_MAX = 200
+
+
+def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
+    """
+    Load the file-based source and collect up to _SAMPLE_LIMIT distinct non-null
+    values for every column in every table.  Returns:
+        { table_name: { col_name: [val1, val2, ...] } }
+    Returns empty dict on any failure.
+    """
+    import re as _re
+    import sqlite3
+
+    db = config.db_type.lower()
+    fpath = config.db_file_path
+    if not fpath:
+        return {}
+
+    def _safe(name: str) -> str:
+        s = _re.sub(r"[^A-Za-z0-9_]", "_", str(name))
+        return ("s_" + s if s and s[0].isdigit() else s) or "col"
+
+    try:
+        if db == "sqlite":
+            conn = sqlite3.connect(fpath, check_same_thread=False)
+        else:
+            import pandas as pd
+            conn = sqlite3.connect(":memory:", check_same_thread=False)
+
+            if db == "csv":
+                from pathlib import Path
+                for f in sorted(Path(fpath).glob("*.csv")):
+                    try:
+                        df = pd.read_csv(f)
+                        # deduplicate columns
+                        used: dict = {}
+                        new_cols = []
+                        for c in df.columns:
+                            sc = _safe(str(c))
+                            if sc in used:
+                                used[sc] += 1
+                                sc = f"{sc}_{used[sc]}"
+                            else:
+                                used[sc] = 1
+                            new_cols.append(sc)
+                        df.columns = new_cols
+                        df.to_sql(f.stem, conn, if_exists="replace", index=False)
+                    except Exception:
+                        pass
+            else:  # excel
+                xl = pd.ExcelFile(fpath)
+                used_sheets: dict = {}
+                for sheet in xl.sheet_names:
+                    base = _safe(sheet)
+                    if base in used_sheets:
+                        used_sheets[base] += 1
+                        safe_sheet = f"{base}_{used_sheets[base]}"
+                    else:
+                        used_sheets[base] = 1
+                        safe_sheet = base
+                    try:
+                        df = xl.parse(sheet)
+                        used_cols: dict = {}
+                        new_cols = []
+                        for c in df.columns:
+                            sc = _safe(str(c))
+                            if sc in used_cols:
+                                used_cols[sc] += 1
+                                sc = f"{sc}_{used_cols[sc]}"
+                            else:
+                                used_cols[sc] = 1
+                            new_cols.append(sc)
+                        df.columns = new_cols
+                        df.to_sql(safe_sheet, conn, if_exists="replace", index=False)
+                    except Exception:
+                        pass
+
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+
+        samples: Dict[str, Dict[str, List]] = {}
+        for tbl in tables:
+            try:
+                cur.execute(f'PRAGMA table_info("{tbl}")')
+                cols = [r[1] for r in cur.fetchall()]
+                col_samples: Dict[str, List] = {}
+                for col in cols:
+                    try:
+                        cur.execute(
+                            f'SELECT COUNT(DISTINCT "{col}") FROM "{tbl}"'
+                        )
+                        distinct_count = (cur.fetchone() or [0])[0]
+                        if distinct_count > _SAMPLE_DISTINCT_MAX:
+                            continue  # skip high-cardinality columns (IDs etc.)
+                        cur.execute(
+                            f'SELECT DISTINCT "{col}" FROM "{tbl}" '
+                            f'WHERE "{col}" IS NOT NULL LIMIT {_SAMPLE_LIMIT}'
+                        )
+                        vals = [str(r[0]) for r in cur.fetchall() if r[0] is not None]
+                        if vals:
+                            col_samples[col] = vals
+                    except Exception:
+                        pass
+                if col_samples:
+                    samples[tbl] = col_samples
+            except Exception:
+                pass
+
+        conn.close()
+        return samples
+
+    except Exception as exc:
+        logger.warning("understand_node: sample_file_data failed — %s", exc)
+        return {}
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -87,6 +208,7 @@ def _summarise_graph(
     nodes: List[Dict[str, Any]],
     edges: List[Dict[str, Any]],
     db_schema: str,
+    samples: Optional[Dict[str, Dict[str, List]]] = None,
 ) -> str:
     """
     Convert KG nodes/edges to a schema description the SQL planner can use.
@@ -152,8 +274,14 @@ def _summarise_graph(
         cols = _extract_columns_from_title(title, label)
         if cols:
             lines.append("  Columns:")
+            tbl_samples = (samples or {}).get(label, {})
             for col in cols:
-                lines.append(f"    {col}")
+                col_name = col.split(":")[0].strip()
+                sample_vals = tbl_samples.get(col_name)
+                if sample_vals:
+                    lines.append(f"    {col}  [sample values: {', '.join(repr(v) for v in sample_vals)}]")
+                else:
+                    lines.append(f"    {col}")
 
         # Foreign-key relationships (edges)
         for edge in edges_by_src.get(node_id, []):
@@ -180,7 +308,15 @@ def understand_node(state: DialogState) -> DialogState:
     config: DialogConfig = state["config"]
     db_schema = config.db_schema or ""
 
-    schema_context = _summarise_graph(nodes, edges, db_schema)
+    # For file-based sources, inject sample values so the LLM sees actual data
+    # values (e.g. exact company names) and generates accurate WHERE clauses.
+    samples: Optional[Dict[str, Dict[str, List]]] = None
+    if config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:
+        samples = _sample_file_data(config)
+        if samples:
+            logger.info("understand_node: sampled %d tables for value hints", len(samples))
+
+    schema_context = _summarise_graph(nodes, edges, db_schema, samples)
 
     logger.info(
         "Schema context built: %d chars, %d tables, %d relationships, schema=%r",

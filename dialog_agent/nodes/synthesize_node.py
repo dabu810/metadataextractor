@@ -77,7 +77,7 @@ def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
     msg = client.messages.create(
         model=model,
-        max_tokens=2048,
+        max_tokens=1024,
         temperature=temperature,
         system=system,
         messages=[{"role": "user", "content": user}],

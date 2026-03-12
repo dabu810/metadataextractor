@@ -148,19 +148,8 @@ def _run_dialog(
     with _lock:
         _jobs[job_id]["status"] = "running"
 
-    completed: List[str] = []
     try:
-        agent = DialogAgent(cfg)
-
-        for node_name, state_update in agent.stream_run(natural_query, kg_nodes, kg_edges):
-            clean = node_name.strip("_")
-            with _lock:
-                if clean in DIALOG_NODES and clean not in completed:
-                    completed.append(clean)
-                _jobs[job_id]["completed_nodes"] = list(completed)
-                _jobs[job_id]["current_node"]    = clean
-
-        # Run synchronously to get the full result
+        agent  = DialogAgent(cfg)
         result = agent.run(natural_query, kg_nodes, kg_edges)
 
         with _lock:

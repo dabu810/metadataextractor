@@ -150,9 +150,14 @@ def _build_file_conn(cfg: DialogConfig):
     Load a file-based source (SQLite / CSV / Excel) into a sqlite3 connection.
     The connection is returned open — caller is responsible for closing it.
     File is loaded ONCE so multiple SQL queries can reuse the same connection.
+
+    CSV/Excel sources are loaded into a temp-file SQLite database (not :memory:)
+    so that SQLite can spill sort/aggregation buffers to disk and never hits the
+    "database or disk is full" error that `:memory:` raises on large datasets.
     """
     import re
     import sqlite3
+    import tempfile
     from pathlib import Path
 
     db    = cfg.db_type.lower()
@@ -169,8 +174,15 @@ def _build_file_conn(cfg: DialogConfig):
         return conn
 
     import pandas as pd
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    # Use a named temp file so SQLite can spill to disk; delete=False so it
+    # persists while the connection is open, then we clean it up on close.
+    _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    _tmp.close()
+    _tmp_path = _tmp.name
+    conn = sqlite3.connect(_tmp_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Attach the temp path so caller can unlink it after closing
+    conn._tmp_path = _tmp_path  # type: ignore[attr-defined]
 
     if db == "csv":
         dir_path = Path(fpath)
@@ -320,10 +332,18 @@ def execute_node(state: DialogState) -> DialogState:
 
     finally:
         if file_conn is not None:
+            tmp_path = getattr(file_conn, "_tmp_path", None)
             try:
                 file_conn.close()
             except Exception:
                 pass
+            # Remove the temp SQLite file created for CSV/Excel sources
+            if tmp_path:
+                try:
+                    import os as _os
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     state["query_results"] = results
     state["phase"] = "execute"

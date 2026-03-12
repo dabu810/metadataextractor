@@ -61,12 +61,17 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
     if not fpath:
         return {}
 
+    _tmp_path: Optional[str] = None
     try:
         if db == "sqlite":
             conn = sqlite3.connect(fpath, check_same_thread=False)
         else:
             import pandas as pd
-            conn = sqlite3.connect(":memory:", check_same_thread=False)
+            import tempfile as _tempfile
+            _tmp = _tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            _tmp.close()
+            _tmp_path = _tmp.name
+            conn = sqlite3.connect(_tmp_path, check_same_thread=False)
 
             if db == "csv":
                 from pathlib import Path
@@ -148,10 +153,22 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
                 pass
 
         conn.close()
+        if _tmp_path:
+            try:
+                import os as _os
+                _os.unlink(_tmp_path)
+            except Exception:
+                pass
         return samples
 
     except Exception as exc:
         logger.warning("understand_node: sample_file_data failed — %s", exc)
+        if _tmp_path:
+            try:
+                import os as _os
+                _os.unlink(_tmp_path)
+            except Exception:
+                pass
         return {}
 
 

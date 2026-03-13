@@ -192,7 +192,12 @@ class FunctionalDependencyTool(BaseTool):
             if unique_count is not None and unique_count <= 1:
                 continue
 
-            uniqueness_ratio = (unique_count / row_count) if unique_count is not None else 0.5
+            # Prefer pre-computed ratio from stats; fall back to computing from counts
+            uniqueness_ratio = (
+                s.get("uniqueness_ratio")
+                if s.get("uniqueness_ratio") is not None
+                else ((unique_count / row_count) if unique_count is not None else 0.5)
+            )
 
             # LHS candidate: skip high-null columns (> 80% nulls = unreliable determinant)
             if null_rate <= 0.8:
@@ -211,47 +216,74 @@ class FunctionalDependencyTool(BaseTool):
         dep_cols: List[str],
         max_pairs: int,
         primary_keys: List[str],
+        column_stats: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[List[str], str]]:
         """
         Yield (lhs_list, rhs_col) candidate pairs.
-        Order: single-column LHS → 2-column composite → 3-column composite.
-        Stops when max_pairs is reached.
+
+        Budget allocation:
+          - 60% of max_pairs for single-column LHS (highest quality signal).
+          - 30% for 2-column composite LHS (catch partial keys and join keys).
+          - 10% for 3-column composite LHS.
+
+        Within single-column pairs, higher-uniqueness determinants are tested first
+        (they produce more discriminating FDs).
         """
-        candidates: List[Tuple[List[str], str]] = []
         pk_set = set(primary_keys)
 
-        # Single-column LHS (highest priority)
-        for det, dep in itertools.product(det_cols, dep_cols):
+        single_budget    = max(1, int(max_pairs * 0.60))
+        composite2_budget = max(1, int(max_pairs * 0.30))
+        composite3_budget = max_pairs - single_budget - composite2_budget
+
+        # --- Sort determinant columns: PK cols first, then by uniqueness_ratio desc ---
+        def _det_priority(col: str) -> float:
+            if col in pk_set:
+                return 2.0  # highest priority
+            ratio = (column_stats or {}).get(col, {}).get("uniqueness_ratio") or 0.0
+            return ratio or 0.0
+
+        sorted_det = sorted(det_cols, key=_det_priority, reverse=True)
+
+        candidates: List[Tuple[List[str], str]] = []
+
+        # Single-column LHS
+        for det, dep in itertools.product(sorted_det, dep_cols):
             if det == dep:
                 continue
             candidates.append(([det], dep))
-            if len(candidates) >= max_pairs:
-                return candidates
+            if len(candidates) >= single_budget:
+                break
 
         # 2-column composite LHS
-        for combo in itertools.combinations(det_cols, 2):
-            # Skip if the pair is a superset of the PK (already covered by PK FDs)
+        count2 = 0
+        for combo in itertools.combinations(sorted_det, 2):
             if pk_set and set(combo).issuperset(pk_set):
                 continue
             for dep in dep_cols:
                 if dep in combo:
                     continue
                 candidates.append((list(combo), dep))
-                if len(candidates) >= max_pairs:
-                    return candidates
+                count2 += 1
+                if count2 >= composite2_budget:
+                    break
+            if count2 >= composite2_budget:
+                break
 
-        # 3-column composite LHS (only if budget remains)
-        remaining = max_pairs - len(candidates)
-        if remaining > 0:
-            for combo in itertools.combinations(det_cols, 3):
+        # 3-column composite LHS
+        count3 = 0
+        if composite3_budget > 0:
+            for combo in itertools.combinations(sorted_det, 3):
                 if pk_set and set(combo).issuperset(pk_set):
                     continue
                 for dep in dep_cols:
                     if dep in combo:
                         continue
                     candidates.append((list(combo), dep))
-                    if len(candidates) >= max_pairs:
-                        return candidates
+                    count3 += 1
+                    if count3 >= composite3_budget:
+                        break
+                if count3 >= composite3_budget:
+                    break
 
         return candidates
 
@@ -335,7 +367,7 @@ class FunctionalDependencyTool(BaseTool):
             det_cols, dep_cols = self._prune_columns(
                 columns, primary_keys, column_stats, col_types
             )
-            candidates = self._generate_candidates(det_cols, dep_cols, max_pairs, primary_keys)
+            candidates = self._generate_candidates(det_cols, dep_cols, max_pairs, primary_keys, column_stats)
 
             found_fds: List[Dict] = []
             tested_keys: Set[tuple] = set()  # avoid duplicate SQL calls

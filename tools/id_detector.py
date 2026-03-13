@@ -249,6 +249,17 @@ class InclusionDependencyTool(BaseTool):
     # Candidate generation
     # ------------------------------------------------------------------
 
+    # Column name patterns that suggest relational join/key columns
+    _KEY_PATTERN = re.compile(
+        r'(_id|_key|_code|_no|_num|_ref|id_|key_|fk_|pk_|_fk|_pk|_cd|_nbr|_nr'
+        r'|^id$|^key$|^code$|^num$)$',
+        re.IGNORECASE,
+    )
+
+    def _looks_like_key_col(self, name: str) -> bool:
+        """True if the column name suggests it is an identifier/key/FK column."""
+        return bool(self._KEY_PATTERN.search(name.lower()))
+
     def _generate_column_pairs(
         self,
         left_columns: List[Dict[str, str]],
@@ -259,6 +270,9 @@ class InclusionDependencyTool(BaseTool):
         Returns list of (left_col, right_col, similarity) pairs to test,
         sorted by name similarity (descending) so high-signal pairs are first.
         Only includes type-compatible pairs.
+
+        Zero-similarity pairs are only kept if at least one column looks like
+        a key/ID column — avoids wasting test budget on unrelated columns.
         """
         candidates = []
         for lc in left_columns:
@@ -266,8 +280,12 @@ class InclusionDependencyTool(BaseTool):
                 if not self._types_compatible(lc["data_type"], rc["data_type"]):
                     continue
                 sim = self._name_similarity(lc["name"], rc["name"])
-                # Include any pair with non-zero similarity OR compatible types
-                # (zero-sim pairs are low priority but may still be real FKs)
+                # Discard zero-similarity pairs unless one column looks like a key
+                if sim == 0.0 and not (
+                    self._looks_like_key_col(lc["name"])
+                    or self._looks_like_key_col(rc["name"])
+                ):
+                    continue
                 candidates.append((lc["name"], rc["name"], sim))
 
         # Sort by similarity desc, then deterministically
@@ -288,8 +306,8 @@ class InclusionDependencyTool(BaseTool):
         co-occurring pairs — if (A1→B1) and (A2→B2) both appear in the top-k
         single-column pairs, test the composite (A1,A2) ⊆ (B1,B2).
         """
-        # Only consider high-similarity single pairs as composite seeds
-        top_pairs = [(lc, rc) for lc, rc, sim in single_col_pairs if sim >= 0.7]
+        # Only consider reasonably-similar single pairs as composite seeds
+        top_pairs = [(lc, rc) for lc, rc, sim in single_col_pairs if sim >= 0.6]
         if len(top_pairs) < 2:
             return []
 

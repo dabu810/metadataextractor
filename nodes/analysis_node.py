@@ -47,10 +47,17 @@ def _col_names(table_meta: TableMeta) -> List[str]:
 def _col_stats(table_meta: TableMeta) -> Dict[str, Any]:
     out = {}
     for c in table_meta.columns:
+        row_count = (c.row_count or table_meta.row_count) or 1
+        null_count = c.null_count or 0
+        unique_count = c.unique_count
+        null_rate = null_count / row_count if row_count else 0.0
+        uniqueness_ratio = (unique_count / row_count) if unique_count is not None and row_count else None
         out[c.name] = {
-            "unique_count": c.unique_count,
-            "null_count": c.null_count,
-            "row_count": c.row_count or table_meta.row_count,
+            "unique_count": unique_count,
+            "null_count": null_count,
+            "row_count": row_count,
+            "null_rate": null_rate,
+            "uniqueness_ratio": uniqueness_ratio,
         }
     return out
 
@@ -119,7 +126,7 @@ def analysis_node(state: AgentState) -> AgentState:
     pair_count = 0
     total_col_pairs_tested = 0
 
-    for left_name, right_name in itertools.permutations(table_names, 2):
+    for left_name, right_name in itertools.combinations(table_names, 2):
         # Break when the column-pair budget is exhausted
         if total_col_pairs_tested >= config.max_id_column_pairs:
             logger.info("  IND scan: column-pair budget (%d) reached, stopping.",
@@ -150,15 +157,26 @@ def analysis_node(state: AgentState) -> AgentState:
             total_col_pairs_tested += max_pairs_this_run
             continue
 
+        # Track seen INDs to avoid duplicates (bidirectional check may produce both directions)
+        existing_ind_keys = {
+            (d.left_table, tuple(d.left_columns), d.right_table, tuple(d.right_columns))
+            for d in state["incl_deps"]
+        }
         for ind in result.get("inclusion_dependencies", []):
-            # IND tool may have tested right→left internally; use the actual table names
-            # from the result dict rather than the loop variables
+            lt = ind.get("left_table", left_name)
+            rt = ind.get("right_table", right_name)
+            lc = ind["left_columns"]
+            rc = ind["right_columns"]
+            dedup_key = (lt, tuple(lc), rt, tuple(rc))
+            if dedup_key in existing_ind_keys:
+                continue
+            existing_ind_keys.add(dedup_key)
             state["incl_deps"].append(
                 InclusionDependency(
-                    left_table=ind.get("left_table", left_name),
-                    left_columns=ind["left_columns"],
-                    right_table=ind.get("right_table", right_name),
-                    right_columns=ind["right_columns"],
+                    left_table=lt,
+                    left_columns=lc,
+                    right_table=rt,
+                    right_columns=rc,
                     coverage=ind["coverage"],
                     is_foreign_key_candidate=ind["is_foreign_key_candidate"],
                     ind_type=ind.get("ind_type", "value_subset"),

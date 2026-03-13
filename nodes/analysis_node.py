@@ -101,6 +101,8 @@ def analysis_node(state: AgentState) -> AgentState:
                     dependent=fd["dependent"],
                     confidence=fd["confidence"],
                     num_violations=fd.get("violations", 0),
+                    fd_type=fd.get("fd_type", "non_key"),
+                    description=fd.get("description"),
                 )
             )
         logger.info(
@@ -149,14 +151,18 @@ def analysis_node(state: AgentState) -> AgentState:
             continue
 
         for ind in result.get("inclusion_dependencies", []):
+            # IND tool may have tested right→left internally; use the actual table names
+            # from the result dict rather than the loop variables
             state["incl_deps"].append(
                 InclusionDependency(
-                    left_table=left_name,
+                    left_table=ind.get("left_table", left_name),
                     left_columns=ind["left_columns"],
-                    right_table=right_name,
+                    right_table=ind.get("right_table", right_name),
                     right_columns=ind["right_columns"],
                     coverage=ind["coverage"],
                     is_foreign_key_candidate=ind["is_foreign_key_candidate"],
+                    ind_type=ind.get("ind_type", "value_subset"),
+                    description=ind.get("description"),
                 )
             )
         total_col_pairs_tested += result.get("pairs_tested", max_pairs_this_run)

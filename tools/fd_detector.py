@@ -2,21 +2,27 @@
 LangChain tool: detect functional dependencies within a table.
 
 Algorithm:
-1. Generate candidate LHS-RHS column pairs (skip PKs as trivial determinants,
-   skip high-cardinality columns as dependent).
-2. For each candidate, run SQL GROUP BY to check if LHS → RHS holds.
-3. Return all FDs above the configured confidence threshold.
-
-Optimisations:
-- Prune search space: exclude constant columns, binary columns, etc.
-- Respect max_fd_column_pairs cap to avoid combinatorial explosion.
-- Single SQL query per candidate pair.
+1. Generate candidate LHS-RHS column pairs.
+   - Single-column LHS first, then composite (2-col, then 3-col) within budget.
+2. Prune search space:
+   - Skip constant columns (unique_count <= 1).
+   - Skip columns with null_rate > 0.8 as determinants (weak signal).
+   - Skip BLOB/CLOB/TEXT/JSON columns entirely.
+   - Skip high-cardinality columns as RHS (near-unique → trivially determined by anything unique).
+3. Verify each candidate with SQL GROUP BY via the connector.
+4. Post-process:
+   - Deduplicate FDs with identical LHS+RHS.
+   - Classify FD type: primary_key / candidate_key / partial_key / non_key.
+   - Detect transitively implied FDs (A→C when A→B and B→C both exist at conf=1.0).
+   - Generate plain-English description for each FD.
+5. Return all FDs above the configured confidence threshold.
 """
 from __future__ import annotations
 
 import itertools
 import json
-from typing import Any, Dict, List, Optional, Tuple, Type
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -38,20 +44,106 @@ class FDDetectorInput(BaseModel):
     )
 
 
+# Column data-type families to skip entirely for FD analysis
+_SKIP_TYPE_PATTERNS = re.compile(
+    r'\b(blob|clob|text|json|jsonb|xml|image|bytea|binary|varbinary|longtext|mediumtext|'
+    r'tinytext|ntext|geography|geometry|hstore)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_skippable_type(dtype: str) -> bool:
+    return bool(_SKIP_TYPE_PATTERNS.search(dtype or ""))
+
+
+def _classify_fd_type(
+    lhs: List[str],
+    primary_keys: List[str],
+    column_stats: Optional[Dict[str, Any]],
+) -> str:
+    """Classify a functional dependency by its LHS role."""
+    pk_set = set(primary_keys)
+    lhs_set = set(lhs)
+
+    if pk_set and lhs_set == pk_set:
+        return "primary_key"
+    if pk_set and lhs_set < pk_set:
+        return "partial_key"
+
+    # Candidate key: single column or small set that is unique
+    if column_stats:
+        all_unique = all(
+            (column_stats.get(col, {}).get("uniqueness_ratio", 0) or 0) >= 0.99
+            for col in lhs
+        )
+        if all_unique:
+            return "candidate_key"
+
+    return "non_key"
+
+
+def _describe_fd(
+    lhs: List[str],
+    rhs: List[str],
+    confidence: float,
+    violations: int,
+    fd_type: str,
+    is_transitively_implied: bool = False,
+) -> str:
+    """Generate a plain-English description grounded only in the FD metadata."""
+    lhs_str = " + ".join(f"'{c}'" for c in lhs)
+    rhs_str = f"'{rhs[0]}'" if rhs else "'?'"
+
+    if is_transitively_implied:
+        return (
+            f"{lhs_str} determines {rhs_str} transitively through an intermediate column "
+            f"(confidence {confidence * 100:.1f}%)"
+        )
+
+    if fd_type == "primary_key":
+        return (
+            f"Primary key {lhs_str} uniquely identifies {rhs_str} "
+            f"— PK-implied dependency (0 violations)"
+        )
+    if fd_type == "candidate_key":
+        return (
+            f"Candidate key {lhs_str} uniquely determines {rhs_str} "
+            f"(unique column, 0 violations)"
+        )
+    if fd_type == "partial_key":
+        return (
+            f"Partial key dependency: {lhs_str} → {rhs_str} "
+            f"(LHS is a proper subset of the primary key; confidence {confidence * 100:.1f}%)"
+        )
+
+    if confidence == 1.0:
+        return (
+            f"{lhs_str} uniquely determines {rhs_str} "
+            f"(exact FD, 0 violations in sampled rows)"
+        )
+
+    viol_str = f"{violations} violation{'s' if violations != 1 else ''}"
+    return (
+        f"{lhs_str} mostly determines {rhs_str} "
+        f"({confidence * 100:.1f}% confidence, {viol_str})"
+    )
+
+
 class FunctionalDependencyTool(BaseTool):
     """
     Detect functional dependencies (X → Y) within a single database table.
 
     Uses SQL GROUP BY to verify whether knowing the value of X uniquely
-    determines the value of Y across all rows.  Returns a list of FDs with
-    confidence scores.
+    determines the value of Y across all rows.  Returns FDs with confidence
+    scores, type classifications, and plain-English descriptions.
     """
 
     name: str = "functional_dependency_detector"
     description: str = (
         "Detect functional dependencies (X → Y) in a database table using SQL-based "
-        "GROUP BY analysis.  Returns FDs with confidence scores (1.0 = perfect FD). "
-        "Handles single-column and composite determinants."
+        "GROUP BY analysis.  Returns FDs with confidence scores (1.0 = perfect FD), "
+        "type classifications (primary_key / candidate_key / partial_key / non_key), "
+        "and plain-English descriptions of each dependency."
     )
     args_schema: Type[BaseModel] = FDDetectorInput
     connector: BaseConnector = Field(exclude=True)
@@ -60,7 +152,7 @@ class FunctionalDependencyTool(BaseTool):
         arbitrary_types_allowed = True
 
     # ------------------------------------------------------------------
-    # Candidate generation helpers
+    # Pruning helpers
     # ------------------------------------------------------------------
 
     def _prune_columns(
@@ -68,16 +160,17 @@ class FunctionalDependencyTool(BaseTool):
         columns: List[str],
         primary_keys: List[str],
         stats: Optional[Dict[str, Any]],
+        col_types: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[str], List[str]]:
         """
         Returns (determinant_candidates, dependent_candidates).
 
-        Rules:
-        - Constant columns (unique_count <= 1) are useless as either side.
-        - PK columns can be determinants but are trivial – keep but mark.
-        - Columns with uniqueness_ratio == 1.0 can be determinants (they
-          trivially determine everything); we skip them as RHS candidates
-          because no real FD insight is gained.
+        Pruning rules:
+        - Constant columns (unique_count <= 1): skip both sides.
+        - BLOB/TEXT/JSON type columns: skip both sides (not meaningful for FDs).
+        - High null rate (> 0.8) on LHS: skip as determinant (too many NULLs = weak signal).
+        - Near-unique columns (uniqueness_ratio >= 0.99): skip as RHS — trivially
+          determined by everything, so no business insight.
         """
         pk_set = set(primary_keys)
         det_cands: List[str] = []
@@ -85,19 +178,29 @@ class FunctionalDependencyTool(BaseTool):
 
         for col in columns:
             s = (stats or {}).get(col, {})
-            unique_count = s.get("unique_count", 2)
+            dtype = (col_types or {}).get(col, "")
+
+            # Skip unanalysable types entirely
+            if _is_skippable_type(dtype):
+                continue
+
+            unique_count = s.get("unique_count")
             row_count = s.get("row_count", 2) or 1
-            ratio = unique_count / row_count if row_count else 0
+            null_rate = s.get("null_rate", 0) or 0
 
+            # Constant column — no discriminating power
             if unique_count is not None and unique_count <= 1:
-                continue  # constant column – skip both sides
+                continue
 
-            # Candidate for LHS: anything with reasonable cardinality
-            det_cands.append(col)
+            uniqueness_ratio = (unique_count / row_count) if unique_count is not None else 0.5
 
-            # Candidate for RHS: not a unique-key column (those trivially have
-            # FDs from everything), not a PK column (known)
-            if ratio < 0.99 and col not in pk_set:
+            # LHS candidate: skip high-null columns (> 80% nulls = unreliable determinant)
+            if null_rate <= 0.8:
+                det_cands.append(col)
+
+            # RHS candidate: skip near-unique columns (ratio >= 0.99) — they are trivially
+            # determined by any unique key; skip PK columns too.
+            if uniqueness_ratio < 0.99 and col not in pk_set:
                 dep_cands.append(col)
 
         return det_cands, dep_cands
@@ -111,12 +214,13 @@ class FunctionalDependencyTool(BaseTool):
     ) -> List[Tuple[List[str], str]]:
         """
         Yield (lhs_list, rhs_col) candidate pairs.
-        Generates single-column LHS first, then composite LHS (up to 3 cols).
+        Order: single-column LHS → 2-column composite → 3-column composite.
+        Stops when max_pairs is reached.
         """
-        pk_set = set(primary_keys)
         candidates: List[Tuple[List[str], str]] = []
+        pk_set = set(primary_keys)
 
-        # Single-column determinants
+        # Single-column LHS (highest priority)
         for det, dep in itertools.product(det_cols, dep_cols):
             if det == dep:
                 continue
@@ -124,8 +228,11 @@ class FunctionalDependencyTool(BaseTool):
             if len(candidates) >= max_pairs:
                 return candidates
 
-        # Composite determinants (pairs)
+        # 2-column composite LHS
         for combo in itertools.combinations(det_cols, 2):
+            # Skip if the pair is a superset of the PK (already covered by PK FDs)
+            if pk_set and set(combo).issuperset(pk_set):
+                continue
             for dep in dep_cols:
                 if dep in combo:
                     continue
@@ -133,7 +240,80 @@ class FunctionalDependencyTool(BaseTool):
                 if len(candidates) >= max_pairs:
                     return candidates
 
+        # 3-column composite LHS (only if budget remains)
+        remaining = max_pairs - len(candidates)
+        if remaining > 0:
+            for combo in itertools.combinations(det_cols, 3):
+                if pk_set and set(combo).issuperset(pk_set):
+                    continue
+                for dep in dep_cols:
+                    if dep in combo:
+                        continue
+                    candidates.append((list(combo), dep))
+                    if len(candidates) >= max_pairs:
+                        return candidates
+
         return candidates
+
+    # ------------------------------------------------------------------
+    # Post-processing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _deduplicate(fds: List[Dict]) -> List[Dict]:
+        """Remove FDs with identical (determinant, dependent) pairs, keeping highest confidence."""
+        seen: Dict[tuple, Dict] = {}
+        for fd in fds:
+            key = (tuple(sorted(fd["determinant"])), tuple(sorted(fd["dependent"])))
+            if key not in seen or fd["confidence"] > seen[key]["confidence"]:
+                seen[key] = fd
+        return list(seen.values())
+
+    @staticmethod
+    def _mark_transitive(fds: List[Dict]) -> List[Dict]:
+        """
+        Mark FDs as transitively_implied when a shorter derivation exists.
+
+        A→C is transitively implied if there exists B such that A→B and B→C
+        are both in the FD set at confidence 1.0.
+
+        Only marks at confidence 1.0 to avoid false positives.
+        """
+        # Build lookup: determinant_tuple → set of dependent columns (at conf 1.0)
+        det_to_deps: Dict[tuple, Set[str]] = {}
+        for fd in fds:
+            if fd["confidence"] < 1.0:
+                continue
+            key = tuple(sorted(fd["determinant"]))
+            det_to_deps.setdefault(key, set()).update(fd["dependent"])
+
+        for fd in fds:
+            if fd.get("fd_type") == "primary_key":
+                continue  # never mark PK FDs as transitive
+            if fd["confidence"] < 1.0:
+                continue
+            lhs_key = tuple(sorted(fd["determinant"]))
+            rhs = fd["dependent"][0] if fd["dependent"] else None
+            if rhs is None:
+                continue
+
+            # Check: does LHS determine some B, and does B determine RHS?
+            lhs_deps = det_to_deps.get(lhs_key, set())
+            for intermediate in lhs_deps:
+                if intermediate == rhs:
+                    continue
+                int_key = (intermediate,)
+                int_deps = det_to_deps.get(int_key, set())
+                if rhs in int_deps:
+                    fd["fd_type"] = "transitively_implied"
+                    fd["description"] = _describe_fd(
+                        fd["determinant"], fd["dependent"],
+                        fd["confidence"], fd["violations"],
+                        fd["fd_type"], is_transitively_implied=True,
+                    )
+                    break
+
+        return fds
 
     # ------------------------------------------------------------------
     def _run(
@@ -149,43 +329,89 @@ class FunctionalDependencyTool(BaseTool):
     ) -> str:
         primary_keys = primary_keys or []
         try:
-            det_cols, dep_cols = self._prune_columns(columns, primary_keys, column_stats)
+            # Build type map from stats if available
+            col_types: Dict[str, str] = {}
+
+            det_cols, dep_cols = self._prune_columns(
+                columns, primary_keys, column_stats, col_types
+            )
             candidates = self._generate_candidates(det_cols, dep_cols, max_pairs, primary_keys)
 
-            found_fds = []
+            found_fds: List[Dict] = []
+            tested_keys: Set[tuple] = set()  # avoid duplicate SQL calls
+
             for lhs, rhs in candidates:
+                pair_key = (tuple(sorted(lhs)), rhs)
+                if pair_key in tested_keys:
+                    continue
+                tested_keys.add(pair_key)
+
                 conf, violations = self.connector.check_functional_dependency(
                     schema_name, table_name, lhs, [rhs], sample_size
                 )
-                if conf >= threshold:
-                    # Skip trivial FDs implied by PKs
-                    if set(lhs).issuperset(set(primary_keys)) and primary_keys:
+                if conf < threshold:
+                    continue
+
+                # Skip FDs trivially implied by a PK superset (PK already determines everything)
+                if primary_keys and set(lhs).issuperset(set(primary_keys)):
+                    # Will be captured as PK FDs below; skip to avoid double-counting
+                    continue
+
+                fd_type = _classify_fd_type(lhs, primary_keys, column_stats)
+                description = _describe_fd(lhs, [rhs], conf, violations, fd_type)
+
+                found_fds.append({
+                    "table": table_name,
+                    "determinant": lhs,
+                    "dependent": [rhs],
+                    "confidence": round(conf, 4),
+                    "violations": violations,
+                    "fd_type": fd_type,
+                    "description": description,
+                })
+
+            # Explicit PK-based FDs (PK → every non-PK column)
+            if primary_keys:
+                pk_rhs_set = {fd["dependent"][0] for fd in found_fds
+                              if fd.get("fd_type") == "primary_key"}
+                for dep in dep_cols:
+                    if dep in primary_keys or dep in pk_rhs_set:
                         continue
-                    found_fds.append({
+                    description = _describe_fd(
+                        primary_keys, [dep], 1.0, 0, "primary_key"
+                    )
+                    found_fds.insert(0, {
                         "table": table_name,
-                        "determinant": lhs,
-                        "dependent": [rhs],
-                        "confidence": round(conf, 4),
-                        "violations": violations,
+                        "determinant": primary_keys,
+                        "dependent": [dep],
+                        "confidence": 1.0,
+                        "violations": 0,
+                        "fd_type": "primary_key",
+                        "description": description,
+                        "source": "primary_key",
                     })
 
-            # Also record PK-based FDs explicitly
-            if primary_keys:
-                for dep in dep_cols:
-                    if dep not in primary_keys:
-                        found_fds.insert(0, {
-                            "table": table_name,
-                            "determinant": primary_keys,
-                            "dependent": [dep],
-                            "confidence": 1.0,
-                            "violations": 0,
-                            "source": "primary_key",
-                        })
+            # Deduplicate, then mark transitive FDs
+            found_fds = self._deduplicate(found_fds)
+            found_fds = self._mark_transitive(found_fds)
+
+            # Sort: PK FDs first, then by confidence desc, then LHS length asc
+            _type_order = {
+                "primary_key": 0, "candidate_key": 1, "partial_key": 2,
+                "non_key": 3, "transitively_implied": 4,
+            }
+            found_fds.sort(key=lambda f: (
+                _type_order.get(f.get("fd_type", "non_key"), 9),
+                -f["confidence"],
+                len(f["determinant"]),
+            ))
 
             return json.dumps({
                 "table": table_name,
                 "functional_dependencies": found_fds,
                 "candidates_tested": len(candidates),
+                "determinant_columns": len(det_cols),
+                "dependent_columns": len(dep_cols),
             }, default=str)
 
         except Exception as e:

@@ -27,6 +27,9 @@ class ColumnMeta:
     avg_value: Optional[float] = None
     stddev_value: Optional[float] = None
     top_values: Optional[List[Any]] = None    # up to 10 most frequent
+    description: Optional[str] = None         # plain-English description inferred from metadata
+    domain: Optional[str] = None              # e.g. "identifier", "monetary", "date_time", etc.
+    pattern_hints: Optional[List[str]] = None # detected value patterns, e.g. ["EMAIL", "UUID"]
 
 
 @dataclass
@@ -43,6 +46,7 @@ class TableMeta:
     create_time: Optional[str] = None
     last_modified: Optional[str] = None
     partitioned_by: Optional[List[str]] = None
+    description: Optional[str] = None         # plain-English description inferred from name + columns
 
 
 @dataclass
@@ -53,6 +57,8 @@ class FunctionalDependency:
     dependent: List[str]       # Y (right-hand side)
     confidence: float          # fraction of tuples satisfying the FD
     num_violations: int = 0
+    fd_type: str = "non_key"   # "primary_key" | "candidate_key" | "partial_key" | "non_key" | "transitively_implied"
+    description: Optional[str] = None
 
 
 @dataclass
@@ -64,6 +70,8 @@ class InclusionDependency:
     right_columns: List[str]
     coverage: float            # fraction of left values found in right
     is_foreign_key_candidate: bool = False
+    ind_type: str = "value_subset"  # "exact_foreign_key" | "strong_fk_candidate" | "partial_inclusion" | "value_subset"
+    description: Optional[str] = None
 
 
 @dataclass

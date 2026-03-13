@@ -72,6 +72,37 @@ Rules:
 11. Date/period filters: if filtering by year/month, check column names in the schema
     carefully — use the correct column (e.g. Year, Month, Period) and match the sample
     value format (e.g. integer 2026 vs string '2026').
+12. COUNT vs SUM — choose the correct aggregate:
+    a. Use COUNT(*) or COUNT(column) when the question asks for:
+         headcount, number of people, how many employees/records/rows,
+         total count, number of [entities].
+       COUNT(*) counts ROWS — one row = one person/record.
+    b. Use SUM(column) ONLY when the question asks for:
+         total revenue, total amount, total value, sum of [a numeric measure].
+       SUM adds up the VALUES stored in a numeric column — use it only when
+       each row stores a quantity that should be added together.
+    c. NEVER use SUM() to answer a headcount or "how many" question.
+       NEVER use COUNT() to answer a "total revenue" or "total amount" question.
+    d. If the schema has a dedicated numeric "Headcount" column (e.g. col_Headcount,
+       Headcount, FTE) where each row stores a count value (not just 1),
+       use SUM(Headcount) — not COUNT(*).  Otherwise use COUNT(*).
+    e. When asked for breakdown by category (e.g. onshore vs offshore headcount),
+       GROUP BY the category column and apply the correct aggregate per group.
+13. Percentage calculations — when the question asks for %, share, proportion,
+    or percentage of a total:
+    a. Always compute the percentage IN SQL — do not leave it to the reader.
+    b. Use a window function to avoid a subquery where possible:
+         ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Percentage
+       or for SUM-based measures:
+         ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Percentage
+    c. Always include both the raw value (count or sum) AND the percentage column
+       in the SELECT list so the user sees both.
+    d. Label the percentage column clearly, e.g. AS Headcount_Pct or AS Revenue_Pct.
+    e. Round percentages to 2 decimal places with ROUND(..., 2).
+    f. If asked "what percentage is X of Y" without a GROUP BY, use a single-row
+       scalar expression:
+         SELECT ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM table), 2) AS Pct
+       — still include the raw numerator and denominator counts alongside it.
 """
 
 _USER_PROMPT = """\
@@ -92,6 +123,11 @@ CRITICAL REMINDERS:
   data from two tables that have no valid join key. One query = one table (or validly joined tables).
 - For any text/string filter, use case-insensitive matching (LOWER() LIKE or exact sample value).
 - If [sample values] are shown for a column, pick the matching value verbatim from that list.
+- COUNT vs SUM: use COUNT(*) for headcount/how-many questions; use SUM(col) only for
+  monetary/quantity totals. NEVER use SUM() to count people or rows.
+- PERCENTAGES: if the question asks for %, share, or proportion — compute it in SQL
+  using ROUND(value * 100.0 / SUM(value) OVER (), 2). Always include both the raw
+  value and the percentage column. Do not leave percentage calculation to the reader.
 
 Return the JSON array of SQL queries now.
 """
@@ -335,6 +371,109 @@ def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     return sql
 
 
+_PERCENTAGE_KEYWORDS = re.compile(
+    r'\b(percent(?:age)?|%|share|proportion|breakdown|distribution|'
+    r'ratio|split|how\s+much\s+(?:is|are)|out\s+of\s+total)\b',
+    re.IGNORECASE,
+)
+
+
+def _fix_percentage(sql: str, natural_query: str) -> str:
+    """
+    If the question asks for a percentage and the SQL has a GROUP BY aggregate
+    but no percentage column, inject a window-function percentage expression.
+
+    Works for both COUNT(*) and SUM(col) aggregates.
+    Leaves the SQL unchanged if it already contains a percentage expression.
+    """
+    if not _PERCENTAGE_KEYWORDS.search(natural_query):
+        return sql
+
+    sql_upper = sql.upper()
+
+    # Already has a percentage calculation — leave it alone
+    if "100.0" in sql or "100.0" in sql_upper or re.search(r'\bPCT\b|\bPERCENT', sql, re.IGNORECASE):
+        return sql
+
+    # Only patch GROUP BY queries (window function needs GROUP BY context)
+    if "GROUP BY" not in sql_upper:
+        return sql
+
+    # Find the last column in the SELECT list before FROM and inject percentage
+    # Pattern: match COUNT(*) or SUM(col) aggregate in SELECT
+    agg_match = re.search(
+        r'(COUNT\s*\(\s*\*\s*\)|SUM\s*\([^)]+\))\s*(?:AS\s+\w+)?',
+        sql, re.IGNORECASE
+    )
+    if not agg_match:
+        return sql
+
+    agg_expr = agg_match.group(1)  # e.g. COUNT(*) or SUM(col_Revenue)
+
+    # Build percentage window expression
+    pct_expr = f"ROUND({agg_expr} * 100.0 / SUM({agg_expr}) OVER (), 2) AS Percentage"
+
+    # Inject before FROM
+    from_pos = sql_upper.find(" FROM ")
+    if from_pos == -1:
+        return sql
+
+    patched = sql[:from_pos] + ",\n       " + pct_expr + sql[from_pos:]
+    logger.info("plan_node: percentage question detected — injected window percentage column")
+    return patched
+
+
+_HEADCOUNT_KEYWORDS = re.compile(
+    r'\b(headcount|head\s*count|head count|fte|people|employees?|'
+    r'staff|workforce|workers?|resources?|associates?|members?|'
+    r'how\s+many|number\s+of\s+(?:people|employees?|staff|resources?))\b',
+    re.IGNORECASE,
+)
+
+_HEADCOUNT_COL_NAMES = re.compile(
+    r'\b(headcount|head_count|fte|employee_count|emp_count|staff_count|'
+    r'resource_count|count_of|no_of|num_of)\b',
+    re.IGNORECASE,
+)
+
+
+def _fix_count_vs_sum(sql: str, natural_query: str) -> str:
+    """
+    If the question is about headcount / how many people, and the SQL uses
+    SUM(col) on a column that is NOT a dedicated numeric headcount column,
+    replace it with COUNT(*).
+
+    We do NOT touch SUM() on columns that look like genuine numeric measures
+    (revenue, amount, cost, salary, etc.).
+    """
+    if not _HEADCOUNT_KEYWORDS.search(natural_query):
+        return sql  # Not a headcount question — leave SQL unchanged
+
+    _MONEY_COL = re.compile(
+        r'\b(revenue|amount|cost|salary|wage|budget|expense|'
+        r'price|value|margin|profit|loss)\b',
+        re.IGNORECASE,
+    )
+
+    def _replace_sum(m: re.Match) -> str:
+        col = m.group(1)
+        # If the column itself looks like a monetary/measure column, leave it
+        if _MONEY_COL.search(col):
+            return m.group(0)
+        # If the column looks like a dedicated headcount column, keep SUM (values >1)
+        if _HEADCOUNT_COL_NAMES.search(col):
+            return m.group(0)
+        # Otherwise replace SUM(col) → COUNT(*)
+        return "COUNT(*)"
+
+    fixed = re.sub(r'\bSUM\s*\(\s*([^()]+?)\s*\)', _replace_sum, sql, flags=re.IGNORECASE)
+    if fixed != sql:
+        logger.info(
+            "plan_node: headcount question detected — replaced SUM() with COUNT(*) in SQL"
+        )
+    return fixed
+
+
 def plan_node(state: DialogState) -> DialogState:
     """Decompose the NQL into SQL queries via LLM."""
     logger.info("=== plan_node ===")
@@ -430,6 +569,10 @@ def plan_node(state: DialogState) -> DialogState:
         sql = item["sql"].strip()
         # Safety net: ensure table names are schema-qualified even if LLM forgot
         sql = _qualify_sql(sql, db_schema, table_labels)
+        # Headcount fix: replace SUM() with COUNT(*) when question is about people
+        sql = _fix_count_vs_sum(sql, natural_query)
+        # Percentage fix: inject window-function percentage column when % is asked for
+        sql = _fix_percentage(sql, natural_query)
 
         # Multi-table check: reject any query that references more than one table
         # when no valid join key was listed in the schema context.  This catches

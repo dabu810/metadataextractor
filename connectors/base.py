@@ -183,20 +183,34 @@ class BaseConnector(abc.ABC):
         """
         Returns (confidence, num_violations).
         confidence = 1.0 means perfect FD.
+
         Uses: for each distinct value of determinant, count distinct values of dependent.
         If max(count) == 1 → perfect FD.
+
+        Sampling: rows are filtered to exclude NULLs in determinant columns, then
+        limited to sample_size.  The GROUP BY then runs over the sampled rows.
+        For tables larger than sample_size this is an approximation — increase
+        sample_size in AgentConfig for higher accuracy at the cost of more CPU.
         """
         fqn = self._fqn(schema, table)
-        sample_clause = self._sample_clause(sample_size)
         det_cols = ", ".join(self._quote(c) for c in determinant_cols)
         dep_cols = ", ".join(self._quote(c) for c in dependent_cols)
 
+        # Build NOT NULL filter for all determinant columns to avoid grouping NULLs
+        null_filters = " AND ".join(
+            f"{self._quote(c)} IS NOT NULL" for c in determinant_cols
+        )
+        where_clause = f"WHERE {null_filters}" if null_filters else ""
+
         sql = (
-            f"SELECT MAX(dep_cnt) AS max_dep, SUM(CASE WHEN dep_cnt > 1 THEN 1 ELSE 0 END) AS violations, "
+            f"SELECT MAX(dep_cnt) AS max_dep, "
+            f"SUM(CASE WHEN dep_cnt > 1 THEN 1 ELSE 0 END) AS violations, "
             f"COUNT(*) AS total_groups "
             f"FROM ("
             f"  SELECT {det_cols}, COUNT(DISTINCT {dep_cols}) AS dep_cnt "
-            f"  FROM {fqn} {sample_clause} "
+            f"  FROM ("
+            f"    SELECT {det_cols}, {dep_cols} FROM {fqn} {where_clause} LIMIT {sample_size}"
+            f"  ) sampled "
             f"  GROUP BY {det_cols}"
             f") sub"
         )
@@ -204,7 +218,6 @@ class BaseConnector(abc.ABC):
             row = self.execute(sql)
             if not row or row[0]["total_groups"] is None:
                 return 0.0, 0
-            max_dep = row[0]["max_dep"] or 1
             violations = row[0]["violations"] or 0
             total = row[0]["total_groups"] or 1
             confidence = 1.0 - (violations / total)
@@ -219,32 +232,45 @@ class BaseConnector(abc.ABC):
         sample_size: int = 10_000,
     ) -> float:
         """
-        Returns the fraction of left_table[left_cols] values found in right_table[right_cols].
-        1.0 = full IND.
+        Returns the fraction of left_table[left_cols] distinct values found in
+        right_table[right_cols].  1.0 = full IND.
+
+        Sampling strategy:
+        - Left (referencing) side: DISTINCT values extracted first, then limited to
+          sample_size.  This ensures the sample represents the actual value distribution
+          rather than just the first N rows of the table (which could miss values that
+          only appear later in the file).
+        - Right (referenced) side: full distinct scan — no sampling.  We need ALL
+          reference values to correctly measure how many left-side values are covered.
         """
         left_fqn  = self._fqn(schema, left_table)
         right_fqn = self._fqn(schema, right_table)
-        sample_clause = self._sample_clause(sample_size)
 
         if len(left_cols) == 1:
             lc = self._quote(left_cols[0])
             rc = self._quote(right_cols[0])
+            # Get all distinct left values first, then cap at sample_size distinct values
             sql = (
                 f"SELECT "
                 f"COUNT(*) AS total, "
                 f"SUM(CASE WHEN r.{rc} IS NOT NULL THEN 1 ELSE 0 END) AS matched "
-                f"FROM (SELECT DISTINCT {lc} FROM {left_fqn} {sample_clause}) l "
-                f"LEFT JOIN (SELECT DISTINCT {rc} FROM {right_fqn}) r "
+                f"FROM ("
+                f"  SELECT DISTINCT {lc} FROM {left_fqn} WHERE {lc} IS NOT NULL"
+                f"  LIMIT {sample_size}"
+                f") l "
+                f"LEFT JOIN (SELECT DISTINCT {rc} FROM {right_fqn} WHERE {rc} IS NOT NULL) r "
                 f"ON l.{lc} = r.{rc}"
             )
         else:
-            # composite – build CONCAT or ROW compare
+            # composite — build CONCAT or ROW compare
             l_concat = self._concat(left_cols)
             r_concat = self._concat(right_cols)
             sql = (
                 f"SELECT COUNT(*) AS total, "
                 f"SUM(CASE WHEN r.rk IS NOT NULL THEN 1 ELSE 0 END) AS matched "
-                f"FROM (SELECT DISTINCT {l_concat} AS lk FROM {left_fqn} {sample_clause}) l "
+                f"FROM ("
+                f"  SELECT DISTINCT {l_concat} AS lk FROM {left_fqn} LIMIT {sample_size}"
+                f") l "
                 f"LEFT JOIN (SELECT DISTINCT {r_concat} AS rk FROM {right_fqn}) r "
                 f"ON l.lk = r.rk"
             )

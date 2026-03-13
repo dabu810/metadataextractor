@@ -23,7 +23,7 @@ from .nodes import (
     synthesize_node,
     understand_node,
 )
-from .state import DialogState
+from .state import ConversationTurn, DialogState
 
 logger = logging.getLogger(__name__)
 
@@ -57,18 +57,20 @@ class DialogAgent:
         natural_query: str,
         kg_nodes: Optional[List[Dict]] = None,
         kg_edges: Optional[List[Dict]] = None,
+        conversation_history: Optional[List[ConversationTurn]] = None,
     ) -> DialogState:
         return DialogState(
-            config        = self._config,
-            natural_query = natural_query,
-            schema_context= "",
-            kg_nodes      = kg_nodes or [],
-            kg_edges      = kg_edges or [],
-            sql_queries   = [],
-            query_results = [],
-            insights      = "",
-            errors        = [],
-            phase         = "start",
+            config               = self._config,
+            natural_query        = natural_query,
+            schema_context       = "",
+            kg_nodes             = kg_nodes or [],
+            kg_edges             = kg_edges or [],
+            conversation_history = conversation_history or [],
+            sql_queries          = [],
+            query_results        = [],
+            insights             = "",
+            errors               = [],
+            phase                = "start",
         )
 
     def run(
@@ -76,9 +78,10 @@ class DialogAgent:
         natural_query: str,
         kg_nodes: Optional[List[Dict]] = None,
         kg_edges: Optional[List[Dict]] = None,
+        conversation_history: Optional[List[ConversationTurn]] = None,
     ) -> DialogState:
         """Synchronous end-to-end execution; returns the final state."""
-        state = self._initial_state(natural_query, kg_nodes, kg_edges)
+        state = self._initial_state(natural_query, kg_nodes, kg_edges, conversation_history)
         result = self._graph.invoke(state)
         result["phase"] = "done"
         return result
@@ -88,9 +91,10 @@ class DialogAgent:
         natural_query: str,
         kg_nodes: Optional[List[Dict]] = None,
         kg_edges: Optional[List[Dict]] = None,
+        conversation_history: Optional[List[ConversationTurn]] = None,
     ) -> Generator[Tuple[str, DialogState], None, None]:
         """Yield (node_name, state_update) for each completed pipeline node."""
-        state = self._initial_state(natural_query, kg_nodes, kg_edges)
+        state = self._initial_state(natural_query, kg_nodes, kg_edges, conversation_history)
         for event in self._graph.stream(state, stream_mode="updates"):
             for node_name, state_update in event.items():
                 yield node_name, state_update

@@ -111,7 +111,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-
+{history_section}
 NATURAL LANGUAGE QUESTION:
 {natural_query}
 
@@ -542,10 +542,31 @@ def plan_node(state: DialogState) -> DialogState:
         if db_schema
         else "TARGET SCHEMA: (none — use bare table names WITHOUT any schema prefix)"
     )
+
+    # Build conversation history section (last 5 turns, oldest first)
+    history = state.get("conversation_history") or []
+    if history:
+        lines = ["CONVERSATION HISTORY (previous questions in this session — use for context only):"]
+        for turn in history:
+            lines.append(f"Q{turn['turn']}: {turn['question']}")
+            if turn.get("tables_queried"):
+                lines.append(f"  Tables used: {', '.join(turn['tables_queried'])}")
+            if turn.get("insights"):
+                lines.append(f"  Answer summary: {turn['insights'][:300]}")
+        lines.append(
+            "Use this history to resolve pronouns (e.g. 'it', 'that', 'those'), "
+            "implied filters (e.g. 'same service line'), or comparisons to previous results. "
+            "Do NOT reproduce previous SQL — generate fresh SQL for the new question."
+        )
+        history_section = "\n".join(lines) + "\n"
+    else:
+        history_section = ""
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
         schema_line=schema_line,
+        history_section=history_section,
         natural_query=natural_query,
     )
 

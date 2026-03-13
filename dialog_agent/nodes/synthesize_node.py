@@ -42,12 +42,15 @@ CRITICAL RULES — follow these without exception:
 _USER_PROMPT = """\
 ORIGINAL QUESTION:
 {question}
-
+{history_section}
 QUERY RESULTS (use ONLY these values — do not calculate or invent any figures):
 {results_text}
 
 Answer the question using ONLY the exact values present in the query results above.
 If a metric is not in the results, say "not available in the data."
+If the question refers to a previous answer (e.g. "compared to before", "same metric"),
+use the CONVERSATION HISTORY above as reference — but still only report numbers
+from the current query results unless explicitly comparing.
 """
 
 
@@ -118,8 +121,21 @@ def synthesize_node(state: DialogState) -> DialogState:
     if len(results_text) > config.max_insight_rows * 4:
         results_text = results_text[: config.max_insight_rows * 4] + "\n\n*(truncated)*"
 
+    # Build conversation history context
+    history = state.get("conversation_history") or []
+    if history:
+        lines = ["CONVERSATION HISTORY (for context on follow-up questions):"]
+        for turn in history:
+            lines.append(f"Q{turn['turn']}: {turn['question']}")
+            if turn.get("insights"):
+                lines.append(f"  Previous answer: {turn['insights'][:400]}")
+        history_section = "\n".join(lines) + "\n"
+    else:
+        history_section = ""
+
     user_prompt = _USER_PROMPT.format(
         question=natural_query,
+        history_section=history_section,
         results_text=results_text,
     )
 

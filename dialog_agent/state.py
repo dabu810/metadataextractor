@@ -23,6 +23,14 @@ class QueryResult(TypedDict):
     error: Optional[str]
 
 
+class ConversationTurn(TypedDict):
+    """One completed Q&A exchange stored in the session history."""
+    turn: int           # 1-based turn number
+    question: str       # the user's original question
+    insights: str       # synthesized answer (first 600 chars to keep prompt size manageable)
+    tables_queried: List[str]   # table names referenced in the SQL queries
+
+
 class DialogState(TypedDict, total=False):
     # Inputs
     config: Any                        # DialogConfig
@@ -30,6 +38,9 @@ class DialogState(TypedDict, total=False):
     schema_context: str                # graph/ontology summary fed to LLM
     kg_nodes: List[Dict[str, Any]]     # knowledge graph nodes (from KG agent)
     kg_edges: List[Dict[str, Any]]     # knowledge graph edges
+
+    # Conversation context (last N turns from the session)
+    conversation_history: List[ConversationTurn]
 
     # Intermediate
     sql_queries: List[SQLQuery]        # planner output

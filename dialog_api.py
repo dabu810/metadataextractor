@@ -40,6 +40,7 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dialog_agent import DialogAgent, DialogConfig
+from dialog_agent.state import ConversationTurn
 from dialog_agent.nodes.execute_node import (
     list_file_dbs,
     purge_all_file_dbs,
@@ -70,6 +71,13 @@ _lock = threading.Lock()
 #                   cached_at, job_id, insights, sql_queries, query_results, errors}
 _nlq_cache: Dict[str, Dict] = {}
 _cache_lock = threading.Lock()
+
+# ── Session store ──────────────────────────────────────────────────────────────
+# Maps session_id → list of ConversationTurn (up to MAX_HISTORY_TURNS, oldest first)
+_sessions: Dict[str, List[ConversationTurn]] = {}
+_sessions_lock = threading.Lock()
+
+MAX_HISTORY_TURNS = 5
 
 DIALOG_NODES = ["understand", "plan", "execute", "synthesize"]
 
@@ -137,6 +145,11 @@ class QueryRequest(BaseModel):
     # Cache control
     skip_cache: bool = False   # Set True to force a fresh run even if cached
 
+    # Session / conversation context
+    # Pass the session_id returned from a previous /query call to retain context.
+    # Omit (or pass null) to start a new independent session.
+    session_id: Optional[str] = None
+
 
 # ── Background runner ──────────────────────────────────────────────────────────
 
@@ -149,26 +162,59 @@ def _run_dialog(
     cache_key: str,
     db_fingerprint: str,
     kg_fingerprint: str,
+    session_id: str,
+    turn_number: int,
 ) -> None:
     with _lock:
         _jobs[job_id]["status"] = "running"
 
     try:
+        # Fetch current session history before running
+        with _sessions_lock:
+            history = list(_sessions.get(session_id, []))
+
         agent  = DialogAgent(cfg)
-        result = agent.run(natural_query, kg_nodes, kg_edges)
+        result = agent.run(natural_query, kg_nodes, kg_edges, conversation_history=history)
+
+        insights = result.get("insights", "")
+        sql_queries = result.get("sql_queries") or []
 
         with _lock:
             _jobs[job_id].update({
                 "status":          "done",
                 "completed_nodes": list(DIALOG_NODES),
                 "current_node":    "synthesize",
-                "query_count":     len(result.get("sql_queries") or []),
+                "query_count":     len(sql_queries),
                 "result_count":    len(result.get("query_results") or []),
-                "insights":        result.get("insights", ""),
-                "sql_queries":     result.get("sql_queries") or [],
+                "insights":        insights,
+                "sql_queries":     sql_queries,
                 "query_results":   result.get("query_results") or [],
                 "errors":          result.get("errors") or [],
+                "session_id":      session_id,
             })
+
+        # Append this completed turn to the session history (capped at MAX_HISTORY_TURNS)
+        tables_queried = list({
+            ref
+            for q in sql_queries
+            for ref in (q.get("table_refs") or [])
+        })
+        new_turn: ConversationTurn = {
+            "turn": turn_number,
+            "question": natural_query,
+            "insights": insights[:600],   # keep prompt size manageable
+            "tables_queried": tables_queried,
+        }
+        with _sessions_lock:
+            turns = _sessions.setdefault(session_id, [])
+            turns.append(new_turn)
+            # Keep only the last MAX_HISTORY_TURNS turns
+            if len(turns) > MAX_HISTORY_TURNS:
+                _sessions[session_id] = turns[-MAX_HISTORY_TURNS:]
+        logger.info(
+            "Session %s: turn %d added (%d turns in history)",
+            session_id[:8], turn_number, len(_sessions[session_id]),
+        )
 
         # Store in NLQ cache
         with _cache_lock:
@@ -223,6 +269,12 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         row_limit            = req.row_limit,
     )
 
+    # ── Session resolution ─────────────────────────────────────────────────────
+    # Use provided session_id or create a new one
+    session_id = req.session_id or str(uuid.uuid4())
+    with _sessions_lock:
+        turn_number = len(_sessions.get(session_id, [])) + 1
+
     ck = _cache_key(
         req.natural_query, req.db_type, req.db_host,
         req.db_port, req.db_name, req.db_schema, req.kg_nodes,
@@ -255,7 +307,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
                     "cache_hit":       True,
                     "cache_key":       ck,
                 }
-            return {"job_id": job_id, "cache_hit": True}
+            return {"job_id": job_id, "cache_hit": True, "session_id": session_id}
 
     # ── Cache miss: run the full pipeline ─────────────────────────────────────
     job_id = str(uuid.uuid4())
@@ -276,14 +328,16 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
             "error":           None,
             "cache_hit":       False,
             "cache_key":       ck,
+            "session_id":      session_id,
         }
 
     background_tasks.add_task(
         _run_dialog, job_id,
         req.natural_query, req.kg_nodes, req.kg_edges,
         cfg, ck, dbfp, kgfp,
+        session_id, turn_number,
     )
-    return {"job_id": job_id, "cache_hit": False}
+    return {"job_id": job_id, "cache_hit": False, "session_id": session_id}
 
 
 @app.get("/jobs/{job_id}")
@@ -377,6 +431,30 @@ def clear_file_cache():
     count = purge_all_file_dbs()
     logger.info("file_db_cache cleared: %d temp DB(s) removed", count)
     return {"deleted_count": count}
+
+
+# ── Session endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    """Return the conversation history for a session."""
+    with _sessions_lock:
+        turns = _sessions.get(session_id)
+    if turns is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session_id, "turns": turns, "turn_count": len(turns)}
+
+
+@app.delete("/sessions/{session_id}", status_code=200)
+def clear_session(session_id: str):
+    """Clear the conversation history for a session (start fresh)."""
+    with _sessions_lock:
+        existed = session_id in _sessions
+        _sessions.pop(session_id, None)
+    if not existed:
+        raise HTTPException(status_code=404, detail="Session not found")
+    logger.info("Session %s cleared", session_id[:8])
+    return {"deleted": session_id}
 
 
 @app.delete("/file-cache/{file_path:path}", status_code=200)

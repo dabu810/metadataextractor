@@ -35,6 +35,8 @@ def report_node(state: AgentState) -> AgentState:
             "right_table": ind.right_table,
             "right_columns": ind.right_columns,
             "coverage": ind.coverage,
+            "ind_type": ind.ind_type,
+            "description": ind.description,
         }
         for ind in state["incl_deps"]
         if ind.is_foreign_key_candidate
@@ -64,6 +66,8 @@ def report_node(state: AgentState) -> AgentState:
                 "dependent": fd.dependent,
                 "confidence": fd.confidence,
                 "violations": fd.num_violations,
+                "fd_type": fd.fd_type,
+                "description": fd.description,
             }
             for fd in state["func_deps"]
         ],
@@ -75,6 +79,8 @@ def report_node(state: AgentState) -> AgentState:
                 "right_columns": ind.right_columns,
                 "coverage": ind.coverage,
                 "is_fk_candidate": ind.is_foreign_key_candidate,
+                "ind_type": ind.ind_type,
+                "description": ind.description,
             }
             for ind in state["incl_deps"]
         ],

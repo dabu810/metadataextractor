@@ -13,6 +13,15 @@ Cardinality 1:1 -> owl:FunctionalProperty + owl:InverseFunctionalProperty on the
 Cardinality 1:N -> owl:FunctionalProperty on the object property
 FD              -> rdfs:comment annotation on the owning class
 Statistics      -> rdfs:comment annotations on datatype properties (if include_statistics=True)
+
+Descriptions (NEW)
+------------------
+Every class and property now carries one or more structured rdfs:comment annotations:
+  - owl:Class      : table description (entity type, row count, dominant domains)
+  - DatatypeProperty : column description (role, semantic domain, value patterns, cardinality, range)
+  - ObjectProperty   : relationship description (ind_type / cardinality, coverage)
+  - FD annotation    : fd_type, plain-English description, confidence
+All descriptions are derived from metadata facts — no LLM, no hallucination.
 """
 from __future__ import annotations
 
@@ -128,9 +137,36 @@ def build_node(state: OntologyState) -> OntologyState:
         g.add((cls_uri, RDFS.label,  Literal(table_name)))
 
         if isinstance(table_meta, dict):
+            # ── Rich class description ──────────────────────────────────
+            desc_parts = []
+
+            # Primary description from extraction_node (entity type, row count, domain summary)
+            table_desc = table_meta.get("description")
+            if table_desc:
+                desc_parts.append(table_desc)
+
+            # Table comment from the database itself (if any)
+            db_comment = table_meta.get("table_comment")
+            if db_comment:
+                desc_parts.append(f"Database comment: {db_comment}")
+
+            # Row count
             row_count = table_meta.get("row_count")
             if row_count is not None:
-                g.add((cls_uri, RDFS.comment, Literal(f"row_count={row_count}")))
+                desc_parts.append(f"Approximate row count: {row_count:,}")
+
+            # Size
+            size_bytes = table_meta.get("size_bytes")
+            if size_bytes:
+                desc_parts.append(f"Storage size: {size_bytes:,} bytes")
+
+            # Partitioning
+            partitioned_by = table_meta.get("partitioned_by") or []
+            if partitioned_by:
+                desc_parts.append(f"Partitioned by: {', '.join(partitioned_by)}")
+
+            if desc_parts:
+                g.add((cls_uri, RDFS.comment, Literal("\n".join(desc_parts))))
 
         class_map[table_name] = cls_uri
         logger.debug("  Class: %s", table_name)
@@ -146,8 +182,8 @@ def build_node(state: OntologyState) -> OntologyState:
             prop_uri  = ns[f"{_safe(table_name)}_{_safe(col_name)}"]
             xsd_range = _xsd_type(col.get("data_type", ""))
 
-            g.add((prop_uri, RDF.type,   OWL.DatatypeProperty))
-            g.add((prop_uri, RDFS.label, Literal(col_name)))
+            g.add((prop_uri, RDF.type,    OWL.DatatypeProperty))
+            g.add((prop_uri, RDFS.label,  Literal(col_name)))
             g.add((prop_uri, RDFS.domain, cls_uri))
             g.add((prop_uri, RDFS.range,  xsd_range))
 
@@ -164,14 +200,57 @@ def build_node(state: OntologyState) -> OntologyState:
                        Literal(1, datatype=XSD.nonNegativeInteger)))
                 g.add((cls_uri, RDFS.subClassOf, restriction))
 
+            # ── Rich property description ───────────────────────────────
+            prop_desc_parts = []
+
+            # Plain-English description from extraction_node
+            col_desc = col.get("description")
+            if col_desc:
+                prop_desc_parts.append(col_desc)
+
+            # Semantic domain label
+            domain = col.get("domain")
+            if domain and domain != "unknown":
+                prop_desc_parts.append(f"Semantic domain: {domain.replace('_', ' ')}")
+
+            # Value pattern hints
+            pattern_hints = col.get("pattern_hints") or []
+            if pattern_hints:
+                prop_desc_parts.append(f"Value patterns detected: {', '.join(pattern_hints)}")
+
+            # FK reference
+            fk_ref = col.get("fk_references")
+            if col.get("is_foreign_key") and fk_ref:
+                prop_desc_parts.append(f"References: {fk_ref}")
+
+            # Statistics (only if include_statistics is enabled)
             if config.include_statistics:
-                parts = []
-                for key in ("unique_count", "null_count", "min_value", "max_value", "avg_value"):
+                stat_parts = []
+                for key, label in (
+                    ("unique_count", "unique values"),
+                    ("null_count",   "null count"),
+                    ("min_value",    "min"),
+                    ("max_value",    "max"),
+                    ("avg_value",    "avg"),
+                ):
                     val = col.get(key)
                     if val is not None:
-                        parts.append(f"{key}={val}")
-                if parts:
-                    g.add((prop_uri, RDFS.comment, Literal(", ".join(parts))))
+                        stat_parts.append(f"{label}={val}")
+                null_rate = col.get("null_rate")
+                if null_rate is not None:
+                    stat_parts.append(f"null_rate={null_rate:.1%}")
+                if stat_parts:
+                    prop_desc_parts.append(f"Statistics: {', '.join(stat_parts)}")
+
+                # Top values for categorical/low-cardinality columns
+                top_values = col.get("top_values") or []
+                unique_count = col.get("unique_count") or 0
+                if top_values and unique_count <= 20:
+                    vals = ", ".join(f"'{v}'" for v in top_values[:10] if v is not None)
+                    prop_desc_parts.append(f"Sample values: {vals}")
+
+            if prop_desc_parts:
+                g.add((prop_uri, RDFS.comment, Literal("\n".join(prop_desc_parts))))
 
             property_map[(table_name, col_name)] = prop_uri
 
@@ -192,13 +271,24 @@ def build_node(state: OntologyState) -> OntologyState:
             )
             if not ref_table or ref_table not in class_map:
                 continue
-            prop_uri = ns[f"{_safe(table_name)}_fk_{_safe(ref_table)}"]
+            fk_col     = fk.get("column", "")
+            ref_col    = fk.get("referenced_column", "")
+            constraint = fk.get("constraint_name", "")
+            prop_uri   = ns[f"{_safe(table_name)}_fk_{_safe(ref_table)}"]
             if prop_uri in added_obj_props:
                 continue
             g.add((prop_uri, RDF.type,    OWL.ObjectProperty))
-            g.add((prop_uri, RDFS.label,  Literal(f"{table_name} → {ref_table} (FK)")))
+            g.add((prop_uri, RDFS.label,  Literal(f"{table_name} → {ref_table} (explicit FK)")))
             g.add((prop_uri, RDFS.domain, class_map[table_name]))
             g.add((prop_uri, RDFS.range,  class_map[ref_table]))
+            # Description
+            fk_desc_parts = [
+                f"Explicit foreign key: '{table_name}'.{fk_col} → '{ref_table}'.{ref_col}",
+                "Relationship type: explicit referential integrity constraint (DDL-defined)",
+            ]
+            if constraint:
+                fk_desc_parts.append(f"Constraint name: {constraint}")
+            g.add((prop_uri, RDFS.comment, Literal("\n".join(fk_desc_parts))))
             added_obj_props.add(prop_uri)
 
     # ------------------------------------------------------------------
@@ -213,30 +303,93 @@ def build_node(state: OntologyState) -> OntologyState:
         if prop_uri in added_obj_props:
             continue
         g.add((prop_uri, RDF.type,    OWL.ObjectProperty))
-        g.add((prop_uri, RDFS.label,  Literal(f"{left_t} references {right_t}")))
+
+        ind_type = fk.get("ind_type", "value_subset")
+        left_cols  = fk.get("left_columns", [])
+        right_cols = fk.get("right_columns", [])
+        coverage   = fk.get("coverage", 0)
+
+        label = f"{left_t} references {right_t}"
+        if ind_type == "exact_foreign_key":
+            label = f"{left_t} → {right_t} (inferred FK)"
+        elif ind_type == "strong_fk_candidate":
+            label = f"{left_t} → {right_t} (strong FK candidate)"
+        g.add((prop_uri, RDFS.label,  Literal(label)))
         g.add((prop_uri, RDFS.domain, class_map[left_t]))
         g.add((prop_uri, RDFS.range,  class_map[right_t]))
-        g.add((prop_uri, RDFS.comment,
-               Literal(f"FK candidate — coverage={fk.get('coverage', 0):.3f}")))
+
+        # Rich description
+        fk_cand_desc_parts = []
+        ind_description = fk.get("description")
+        if ind_description:
+            fk_cand_desc_parts.append(ind_description)
+        fk_cand_desc_parts.append(
+            f"Relationship type: {ind_type.replace('_', ' ')}"
+        )
+        fk_cand_desc_parts.append(
+            f"Join columns: {', '.join(left_cols)} → {', '.join(right_cols)}"
+        )
+        fk_cand_desc_parts.append(f"Coverage: {coverage:.1%} of left-table values matched")
+        if coverage >= 0.99:
+            fk_cand_desc_parts.append(
+                "Confidence: high — suitable for use as a JOIN key"
+            )
+        elif coverage >= 0.95:
+            fk_cand_desc_parts.append(
+                "Confidence: moderate — orphan records exist; verify before using as FK"
+            )
+        g.add((prop_uri, RDFS.comment, Literal("\n".join(fk_cand_desc_parts))))
         added_obj_props.add(prop_uri)
 
     # ------------------------------------------------------------------
     # 4. ObjectProperties + cardinality from cardinality relationships
     # ------------------------------------------------------------------
     for cr in report.get("cardinality_relationships") or []:
-        left_t   = cr.get("left_table",  "")
-        right_t  = cr.get("right_table", "")
-        rel_type = cr.get("type", "M:N")
+        left_t    = cr.get("left_table",  "")
+        right_t   = cr.get("right_table", "")
+        rel_type  = cr.get("type", "M:N")
+        join_cols = cr.get("join_columns", [])
+        left_uniq = cr.get("left_unique_values", 0)
+        right_uniq= cr.get("right_unique_values", 0)
         if left_t not in class_map or right_t not in class_map:
             continue
         prop_uri = ns[f"{_safe(left_t)}_relates_{_safe(right_t)}"]
         if prop_uri not in added_obj_props:
             g.add((prop_uri, RDF.type,    OWL.ObjectProperty))
-            g.add((prop_uri, RDFS.label,  Literal(f"{left_t} ↔ {right_t}")))
+            g.add((prop_uri, RDFS.label,  Literal(f"{left_t} ↔ {right_t} ({rel_type})")))
             g.add((prop_uri, RDFS.domain, class_map[left_t]))
             g.add((prop_uri, RDFS.range,  class_map[right_t]))
             added_obj_props.add(prop_uri)
-        g.add((prop_uri, RDFS.comment, Literal(f"cardinality={rel_type}")))
+
+        # Rich cardinality description
+        card_desc_parts = [
+            f"Cardinality: {rel_type} relationship between '{left_t}' and '{right_t}'",
+        ]
+        if join_cols:
+            card_desc_parts.append(f"Determined via join columns: {', '.join(join_cols)}")
+        if left_uniq and right_uniq:
+            card_desc_parts.append(
+                f"Distinct values: {left_uniq:,} in '{left_t}', {right_uniq:,} in '{right_t}'"
+            )
+        if rel_type == "1:1":
+            card_desc_parts.append(
+                "Each instance of the left class corresponds to exactly one instance "
+                "of the right class, and vice versa."
+            )
+        elif rel_type == "1:N":
+            card_desc_parts.append(
+                f"One instance of '{left_t}' corresponds to many instances of '{right_t}'."
+            )
+        elif rel_type == "N:1":
+            card_desc_parts.append(
+                f"Many instances of '{left_t}' correspond to one instance of '{right_t}'."
+            )
+        else:
+            card_desc_parts.append(
+                f"Many-to-many relationship between '{left_t}' and '{right_t}'."
+            )
+        g.add((prop_uri, RDFS.comment, Literal("\n".join(card_desc_parts))))
+
         if rel_type == "1:1":
             g.add((prop_uri, RDF.type, OWL.FunctionalProperty))
             g.add((prop_uri, RDF.type, OWL.InverseFunctionalProperty))
@@ -244,17 +397,27 @@ def build_node(state: OntologyState) -> OntologyState:
             g.add((prop_uri, RDF.type, OWL.FunctionalProperty))
 
     # ------------------------------------------------------------------
-    # 5. Annotate classes with FD summaries
+    # 5. Annotate classes with FD summaries (rich descriptions)
     # ------------------------------------------------------------------
     for fd in report.get("functional_dependencies") or []:
         tbl  = fd.get("table", "")
         if tbl not in class_map:
             continue
-        det  = ", ".join(fd.get("determinant") or [])
-        dep  = ", ".join(fd.get("dependent")   or [])
-        conf = fd.get("confidence", 0)
-        g.add((class_map[tbl], RDFS.comment,
-               Literal(f"FD: [{det}] → [{dep}]  conf={conf:.3f}")))
+        det     = ", ".join(fd.get("determinant") or [])
+        dep     = ", ".join(fd.get("dependent")   or [])
+        conf    = fd.get("confidence", 0)
+        fd_type = fd.get("fd_type", "non_key")
+        fd_desc = fd.get("description")
+
+        # Build a structured FD annotation
+        fd_parts = []
+        if fd_desc:
+            fd_parts.append(fd_desc)
+        fd_parts.append(
+            f"FD type: {fd_type.replace('_', ' ')} | "
+            f"[{det}] → [{dep}] | confidence={conf:.3f}"
+        )
+        g.add((class_map[tbl], RDFS.comment, Literal("\n".join(fd_parts))))
 
     state["ontology_graph"]  = g
     state["class_map"]       = class_map
